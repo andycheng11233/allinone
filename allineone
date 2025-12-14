@@ -77,6 +77,13 @@ AI_CACHE_PATH = Path(".cache/ai_processed.json")
 HKJC_ODDS_PROCESSED_PATH = Path(".cache/hkjc_odds_processed.json")
 TITAN_STATS_PROCESSED_PATH = Path(".cache/titan_stats_processed.json")
 
+# Titan pre-scrape integration
+try:
+    from titan_pre_scrape import load_titan_stats_for_today, load_titan_stats_from_file
+    TITAN_PRE_SCRAPE_AVAILABLE = True
+except Exception:
+    TITAN_PRE_SCRAPE_AVAILABLE = False
+
 
 def load_ai_cache() -> Dict[str, Any]:
     try:
@@ -110,6 +117,45 @@ def save_cache_set(path: Path, data: set):
         path.write_text(json.dumps(sorted(list(data))), encoding="utf-8")
     except Exception as e:
         logger.warning("Failed to save cache set to %s: %s", path, e)
+
+
+def load_pre_scraped_titan_stats(stats_dir: str = "titan/stats") -> Dict[str, Dict[str, Any]]:
+    """
+    Load pre-scraped Titan stats for today from disk.
+    Falls back to empty dict if titan_pre_scrape module not available.
+    
+    Args:
+        stats_dir: Directory containing scraped stats
+        
+    Returns:
+        Dictionary mapping match_id -> stats
+    """
+    if not TITAN_PRE_SCRAPE_AVAILABLE:
+        logger.debug("Titan pre-scrape module not available, skipping pre-scraped data load")
+        return {}
+    
+    try:
+        stats_map = load_titan_stats_for_today(stats_dir)
+        if stats_map:
+            logger.info(f"✅ Loaded {len(stats_map)} pre-scraped Titan stats from {stats_dir}")
+        return stats_map
+    except Exception as e:
+        logger.warning(f"Failed to load pre-scraped Titan stats: {e}")
+        return {}
+
+
+def get_titan_stats(match_id: str, pre_scraped_stats: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Get Titan stats for a match, checking pre-scraped data first.
+    
+    Args:
+        match_id: Titan match ID
+        pre_scraped_stats: Dictionary of pre-scraped stats
+        
+    Returns:
+        Stats dictionary if available, None otherwise
+    """
+    return pre_scraped_stats.get(match_id)
 
 
 def cprint(text: str, color: str = '', style: str = ''):
@@ -1423,6 +1469,8 @@ class LiveMatchMatcher:
         self.hkjc_bulk_odds: Dict[str, Dict[str, Any]] = {}
         self.hkjc_odds_processed: set = load_cache_set(HKJC_ODDS_PROCESSED_PATH)
         self.titan_stats_processed: set = load_cache_set(TITAN_STATS_PROCESSED_PATH)
+        # Load pre-scraped Titan stats for today
+        self.pre_scraped_titan_stats: Dict[str, Dict[str, Any]] = load_pre_scraped_titan_stats()
 
     def calculate_name_similarity(self, name1: str, name2: str) -> float:
         def clean_name(name: str) -> str:
@@ -2038,9 +2086,20 @@ class LiveMatchMatcher:
 
                 # Titan stats + AI
                 try:
-                    cprint("   📊 Scraping Titan stats...", Fore.CYAN)
-                    detailed_stats = await scrape_match_stats_from_analysis_page(titan_id)
-                    matched_item['detailed_stats'] = detailed_stats
+                    # Check for pre-scraped stats first
+                    detailed_stats = get_titan_stats(titan_id, self.pre_scraped_titan_stats)
+                    
+                    if detailed_stats:
+                        cprint("   📂 Using pre-scraped Titan stats", Fore.GREEN)
+                        matched_item['detailed_stats'] = detailed_stats
+                        matched_item['stats_source'] = 'pre_scraped'
+                    else:
+                        # Fall back to live scraping
+                        cprint("   📊 Scraping Titan stats...", Fore.CYAN)
+                        detailed_stats = await scrape_match_stats_from_analysis_page(titan_id)
+                        matched_item['detailed_stats'] = detailed_stats
+                        matched_item['stats_source'] = 'live_scraped'
+                    
                     self.titan_stats_processed.add(titan_id)
                     save_cache_set(TITAN_STATS_PROCESSED_PATH, self.titan_stats_processed)
 
