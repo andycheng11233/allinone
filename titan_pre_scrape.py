@@ -331,17 +331,14 @@ async def scrape_match_stats(titan_match_id: str) -> Dict[str, Any]:
                 if not header:
                     return None
                 
-                parent = None
+                # Get parent element, handling both Tag and NavigableString
                 try:
                     if isinstance(header, Tag):
                         parent = header.find_parent()
                     else:
-                        parent = header.parent if hasattr(header, "parent") else None
+                        parent = getattr(header, "parent", None)
                 except Exception:
-                    parent = header.parent if hasattr(header, "parent") else None
-                
-                if not parent:
-                    parent = header.parent if hasattr(header, "parent") else None
+                    parent = getattr(header, "parent", None)
                 
                 if not parent:
                     return None

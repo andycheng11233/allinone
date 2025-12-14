@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Cache and temporary files
+.cache/
+*.log
+.DS_Store
+
+# Output directories and generated files
+titan/stats/*.json
+hkjc/odds/*.json
+macauslot/odds/*.json
+*_allodds_*.json
+*_odds_*.json
+matched_games_*.json
+ai_recommendations_*.json
+detailed_report_*.json
+unmatched_analysis_*.json
+all_sources_*.xlsx
+all_scraped_matches_*.xlsx
+
+# Debug
+debug_session_*/
