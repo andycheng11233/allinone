@@ -362,10 +362,19 @@ def parse_ai_json_response(text: str) -> Tuple[Optional[Dict[str, Any]], Optiona
         s = text.strip()
         if s.startswith("{") and s.endswith("}"):
             return json.loads(s), s
-        m = re.search(r'(\{(?:.|\s)*\})', text)
-        if m:
-            candidate = m.group(1)
-            return json.loads(candidate), candidate
+        # Find JSON object - use a simpler pattern to avoid ReDoS
+        start = text.find('{')
+        if start != -1:
+            # Find matching closing brace by counting braces
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i+1]
+                        return json.loads(candidate), candidate
     except Exception as e:
         logger.debug("AI JSON parse failed: %s", e)
     try:
