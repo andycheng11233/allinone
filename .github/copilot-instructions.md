@@ -95,7 +95,7 @@ python3 allineone
 3. **MacauSlot**: Additional odds source
 
 ### Matching Logic
-- Uses fuzzy matching (SequenceMatcher) to match events across different sources
+- Uses fuzzy matching (`difflib.SequenceMatcher`) to match events across different sources
 - Implements 1:1 matching to avoid Cartesian product explosion
 - Supports caching to skip already processed event IDs
 
