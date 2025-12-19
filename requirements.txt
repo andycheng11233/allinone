@@ -1,0 +1,12 @@
+# Core dependencies for all2 script
+httpx>=0.24.0
+playwright>=1.40.0
+beautifulsoup4>=4.12.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Optional dependencies for enhanced features
+colorama>=0.4.6
+
+# Debug instrumentation (optional)
+# Add debug_instrumentation.py if needed

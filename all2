@@ -17,7 +17,7 @@ Setup:
   export DEEPSEEK_API_KEY=...
   export DEEPSEEK_API_URL=https://api.deepseek.com/chat/completions
 Run:
-  python3 allinone.py
+  python3 all2
 """
 
 import asyncio
