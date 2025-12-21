@@ -893,8 +893,10 @@ class HKJCHomeScraper:
         self.dt_format = "%d/%m/%Y %H:%M"
         self.rows_selector = ".match-row,.event-row"
         self.pause = 0.6
-        self.click_wait = 2.0
-        self.timeout_ms = 12000
+        self.click_wait = 1.8
+        self.timeout_ms = 8000
+        self.max_growth_loops = 12
+        self.max_rows_cap = 200  # safety if declared missing
 
     def _parse_row_start(self, txt: str) -> Optional[datetime]:
         """Parse match start time from date text."""
@@ -910,18 +912,29 @@ class HKJCHomeScraper:
 
     async def _get_declared_count(self, page) -> Optional[int]:
         """Get the declared number of matches from the page."""
+        # Try regex on full HTML, fallback to text locator
         html = await page.content()
         m = re.search(r"共有\s*(\d+)\s*場賽事", html)
-        return int(m.group(1)) if m else None
+        if m:
+            return int(m.group(1))
+        try:
+            loc = page.locator("text=/共有\\s*\\d+\\s*場賽事/")
+            txt = await loc.first.text_content(timeout=2000)
+            m2 = re.search(r"共有\s*(\d+)\s*場賽事", txt or "")
+            if m2:
+                return int(m2.group(1))
+        except Exception:
+            pass
+        return None
 
     async def _scroll_bottom(self, page):
         """Scroll to bottom of page to load lazy content."""
-        await page.mouse.wheel(0, 1800)
+        await page.mouse.wheel(0, 2000)
         await asyncio.sleep(self.pause)
         await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
         await asyncio.sleep(self.pause)
 
-    async def _click_show_more_once(self, page) -> bool:
+    async def _click_show_more(self, page) -> bool:
         """Click the 'Show More' button if visible."""
         xpaths = [
             "//div[contains(text(), '顯示更多')]",
@@ -930,17 +943,30 @@ class HKJCHomeScraper:
             "//a[contains(text(), '顯示更多')]"
         ]
         for xp in xpaths:
-            try:
-                for el in await page.query_selector_all(f"xpath={xp}"):
-                    if await el.is_visible():
-                        await el.scroll_into_view_if_needed()
-                        await asyncio.sleep(0.2)
-                        await el.click()
-                        await asyncio.sleep(0.8)
-                        return True
-            except Exception:
-                continue
+            for el in await page.query_selector_all(f"xpath={xp}"):
+                if await el.is_visible():
+                    await el.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.2)
+                    await el.click()
+                    await asyncio.sleep(0.8)
+                    return True
         return False
+
+    async def _load_rows_full(self, page, declared: Optional[int]):
+        """Load all rows by clicking show more and scrolling until stable."""
+        last = 0
+        for _ in range(self.max_growth_loops):
+            await self._click_show_more(page)
+            await self._scroll_bottom(page)
+            cnt = await page.evaluate(f"() => document.querySelectorAll('{self.rows_selector}').length")
+            if declared and cnt >= declared:
+                break
+            if cnt <= last:
+                break
+            last = cnt
+        rows = page.locator(self.rows_selector)
+        total = await rows.count()
+        return rows, total
 
     async def _scrape_one(self, url: str) -> List[Dict[str, Any]]:
         """
@@ -949,12 +975,13 @@ class HKJCHomeScraper:
         This method:
         1. Sets up network monitoring to capture /allodds/ URLs
         2. Loads the page and clicks "Show More" to reveal all matches
-        3. Iterates through match rows
+        3. Iterates through match rows (refreshing locators to avoid staleness)
         4. Skips already-started games based on date
         5. Tries multiple triggers (odds links, team icons) with Ctrl/Cmd-click
         6. Captures event IDs from popup URLs or navigation
         """
         import sys
+        from contextlib import suppress
         
         results: List[Dict[str, Any]] = []
         now = datetime.now()
@@ -969,6 +996,7 @@ class HKJCHomeScraper:
                 )
             )
             page = await context.new_page()
+            page.set_default_timeout(self.timeout_ms)
             
             # Track captured event IDs from network
             collected = set()
@@ -978,7 +1006,6 @@ class HKJCHomeScraper:
                 eid = self._extract_id_from_url(url_str)
                 if eid:
                     collected.add(eid)
-                    logger.debug("Captured via network: %s", eid)
             
             # Monitor network for /allodds/ URLs
             context.on("request", lambda req: log_url(req.url))
@@ -986,47 +1013,45 @@ class HKJCHomeScraper:
             
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.8)
                 
-                # Get declared count and click show more
+                # Get declared count
                 declared = await self._get_declared_count(page)
                 logger.info("Declared matches: %s", declared if declared else "not found")
                 
-                await self._click_show_more_once(page)
-                await self._scroll_bottom(page)
+                # Load all rows
+                rows, total = await self._load_rows_full(page, declared)
+                target_total = declared or min(total, self.max_rows_cap)
+                logger.info("Rows detected: %d, processing up to: %d", total, target_total)
                 
-                # Check if we need more scrolling
-                row_count = await page.evaluate(f"() => document.querySelectorAll('{self.rows_selector}').length")
-                if declared and row_count < declared:
-                    await self._scroll_bottom(page)
-                
-                # Get all rows
-                rows = page.locator(self.rows_selector)
-                total = await rows.count()
-                logger.info("Row count: %d", total)
-                
-                # Process each row
-                for i in range(total):
+                # Process each row with fresh locators to avoid staleness
+                i = 0
+                while i < target_total:
+                    # Refresh rows each loop to avoid stale locators
+                    rows, total = await self._load_rows_full(page, declared)
+                    if i >= total:
+                        break
                     row = rows.nth(i)
+                    
                     try:
                         # Get row ID
-                        rid = (await row.get_attribute("id")) or ""
+                        rid = None
+                        with suppress(Exception):
+                            rid = await row.get_attribute("id")
                         if not rid:
-                            try:
+                            with suppress(Exception):
                                 rid = await row.locator(".fb-id").first.text_content()
-                            except Exception:
-                                rid = ""
                         rid = (rid or "").strip()
                         
                         # Check if game already started
-                        try:
+                        dt_txt = None
+                        with suppress(Exception):
                             dt_txt = await row.locator(".date").first.text_content()
-                            start_dt = self._parse_row_start(dt_txt or "")
-                            if start_dt and start_dt <= now:
-                                logger.debug("[%d/%d] %s skip (started)", i+1, total, rid)
-                                continue
-                        except Exception:
-                            pass
+                        start_dt = self._parse_row_start(dt_txt or "")
+                        if start_dt and start_dt <= now:
+                            logger.debug("[%d/%d] %s skip (started)", i+1, total, rid)
+                            i += 1
+                            continue
                         
                         # Find a trigger element to click
                         trigger = None
@@ -1040,20 +1065,17 @@ class HKJCHomeScraper:
                             cand = row.locator(sel)
                             if await cand.count():
                                 trigger = cand.first
-                                logger.debug("[%d/%d] %s using selector: %s", i+1, total, rid, sel)
                                 break
                         
                         if not trigger:
-                            logger.debug("[%d/%d] %s no trigger found", i+1, total, rid)
+                            logger.debug("[%d/%d] %s no trigger", i+1, total, rid)
+                            i += 1
                             continue
                         
                         # Try to click with modifier key to open in new tab/window
                         pages_before = set(context.pages)
-                        try:
+                        with suppress(Exception):
                             await trigger.click(modifiers=mod_key, force=True)
-                        except Exception as e:
-                            logger.debug("[%d/%d] %s click error: %s", i+1, total, rid, e)
-                        
                         await asyncio.sleep(self.click_wait)
                         
                         # Check for new popup or navigation
@@ -1064,35 +1086,33 @@ class HKJCHomeScraper:
                         if new_pages:
                             # New tab/window opened
                             np = new_pages[0]
-                            try:
+                            with suppress(Exception):
                                 await np.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
-                            except Exception:
-                                pass
                             url_captured = np.url
-                            logger.debug("[%d/%d] %s popup URL: %s", i+1, total, rid, url_captured)
-                            try:
+                            with suppress(Exception):
                                 await np.close()
-                            except Exception:
-                                pass
                         else:
                             # Check if same page navigated
                             if self._extract_id_from_url(page.url):
                                 url_captured = page.url
-                                logger.debug("[%d/%d] %s same-page URL: %s", i+1, total, rid, url_captured)
-                                try:
+                                with suppress(Exception):
                                     await page.go_back()
-                                except Exception:
-                                    pass
                         
                         # Extract event ID from captured URL
                         if url_captured:
                             eid = self._extract_id_from_url(url_captured)
                             if eid:
                                 collected.add(eid)
-                                logger.debug("[%d/%d] %s captured ID: %s", i+1, total, rid, eid)
+                                logger.debug("[%d/%d] %s captured %s", i+1, total, rid, eid)
+                            else:
+                                logger.debug("[%d/%d] %s nav w/o id", i+1, total, rid)
+                        else:
+                            logger.debug("[%d/%d] %s no popup/nav", i+1, total, rid)
                     
                     except Exception as e:
                         logger.debug("[%d/%d] error: %s", i+1, total, e)
+                    
+                    i += 1
                 
             finally:
                 await browser.close()
