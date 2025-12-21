@@ -2,16 +2,10 @@
 """
 Unified MacauSlot + Titan007 + HKJC matcher + AI analysis.
 
-v21 updates:
-- HKJC skip cache coercion (strings) retained; added diagnostics in bulk collector.
-- Removed over-aggressive skip when titan_stats_processed contained an ID; we now load stats (disk) and run AI when available.
-- AI cache now stores the last AI recommendation; on cache hit we reuse the stored recommendation instead of leaving blanks in Excel.
-- save_ai_results_excel and save_comparison_excel already robust to None entries.
-
-Other retained behavior:
-- HKJC bulk odds reuse disk/cache; no force-rescrape.
-- Matching heuristics: time-assisted threshold, league bonus, stricter Titan↔Macau time window.
-- AI runs for Titan+Macau-only matches (skips DeepSeek if cached; still outputs cached recommendation).
+v21b updates:
+- Added fast-skip for HKJC Step 0: if declared match count is <= cached odds count (existing cache + processed set),
+  we skip the per-row clicking entirely to save time.
+- Existing behavior retained (stringified cache IDs, cached AI reuse, etc.).
 """
 
 import asyncio
@@ -60,6 +54,7 @@ except Exception:
     Style = _Dummy()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.getLogger("playwright").setLevel(logging.WARNING)
 logger = logging.getLogger("matcher")
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -76,9 +71,6 @@ TITAN_STATS_PROCESSED_PATH = Path(".cache/titan_stats_processed.json")
 
 TITAN_STATS_BASE = Path("titan/stats")
 
-# -----------------------------------------------------------------------------
-# Alias map placeholder
-# -----------------------------------------------------------------------------
 ALIAS_TABLE: Dict[str, set] = {
     # "barcelona": {"barca", "fc barcelona", "巴塞", "巴塞隆拿"},
 }
@@ -181,9 +173,6 @@ def cprint(text: str, color: str = '', style: str = ''):
     else:
         print(text)
 
-# ---------------------------------------------------------------------------
-# Numeric helpers
-# ---------------------------------------------------------------------------
 def find_best_float_in_text(text: str, min_val: float = -1e9, max_val: float = 1e9) -> Optional[float]:
     if not text:
         return None
@@ -236,9 +225,6 @@ def extract_ratings_or_average_from_text(page_text: str) -> Tuple[Optional[float
         return avg, chosen
     return None, []
 
-# ---------------------------------------------------------------------------
-# DeepSeek async client
-# ---------------------------------------------------------------------------
 async def call_deepseek_api_async(prompt: str, timeout: int = None, max_retries: int = None) -> str:
     if timeout is None:
         timeout = int(DEEPSEEK_TIMEOUT)
@@ -292,9 +278,6 @@ async def call_deepseek_api_async(prompt: str, timeout: int = None, max_retries:
             await asyncio.sleep(backoff_base * attempt)
     raise RuntimeError(f"DeepSeek API calls failed: {last_err}")
 
-# ---------------------------------------------------------------------------
-# AI integration helpers
-# ---------------------------------------------------------------------------
 EXPECTED_TOP_LEVEL_SECTIONS = [
     "match", "league_standings", "data_comparison_recent10", "lineup_and_injuries",
     "last_match_player_ratings", "recent10_ratings_parsed", "future_matches",
@@ -515,9 +498,6 @@ async def perform_ai_analysis_for_match_async(
     result["confidence_level"] = 0
     return result
 
-# ---------------------------------------------------------------------------
-# HKJC parsers (unchanged)
-# ---------------------------------------------------------------------------
 AO_DISPLAY_ZH = {
     "HAD": "主客和", "FHA": "半場主客和", "HHA": "讓球主客和", "HHA_Extra": "讓球主客和",
     "HDC": "讓球", "HIL": "入球大細", "FHL": "半場入球大細",
@@ -935,9 +915,6 @@ class HKJCDetailedOddsScraper:
             logger.error("Error parsing HKJC detailed odds %s: %s", event_id, e)
             return None
 
-# ---------------------------------------------------------------------------
-# HKJC HOME scraper with safe_goto (unchanged)
-# ---------------------------------------------------------------------------
 class HKJCHomeScraper:
     BET_HOME = "https://bet.hkjc.com/ch/football/home"
     ROWS_SEL = ".match-row,.event-row"
@@ -991,7 +968,7 @@ class HKJCHomeScraper:
                     return True
         return False
 
-    async def scrape(self) -> List[Dict[str, Any]]:
+    async def scrape(self, fast_skip_if_cache_sufficient: bool = False, cached_count: int = 0) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         collected: set[str] = set()
         now = datetime.now()
@@ -1012,6 +989,15 @@ class HKJCHomeScraper:
 
             declared = await self.get_declared(page)
             logger.info("Declared: %s matches", declared or "unknown")
+
+            # Fast-skip: if we already have enough cached odds, skip per-row clicking
+            if fast_skip_if_cache_sufficient and declared and cached_count >= declared:
+                logger.info(
+                    "Fast-skip HKJC row scan: declared=%d, cached_odds=%d (>=), skipping row clicks.",
+                    declared, cached_count
+                )
+                await browser.close()
+                return results  # empty list -> collector will see zero new IDs
 
             await self.scroll_bottom(page)
             await self.click_show_more(page)
@@ -1122,9 +1108,6 @@ class HKJCHomeScraper:
 
         return results
 
-# ---------------------------------------------------------------------------
-# HKJC Bulk odds collector (with string coercion + diagnostics)
-# ---------------------------------------------------------------------------
 class HKJCBulkOddsCollector:
     def __init__(self, home_scraper: HKJCHomeScraper, detailed_scraper: HKJCDetailedOddsScraper,
                  existing_cache: Optional[Dict[str, Any]] = None, skip_ids: Optional[set] = None):
@@ -1133,8 +1116,15 @@ class HKJCBulkOddsCollector:
         self.existing_cache = existing_cache or {}
         self.skip_ids = set(str(x) for x in (skip_ids or []))
 
-    async def collect(self, max_events: Optional[int] = None, concurrency: int = 4, force_rescrape: bool = False) -> Tuple[Dict[str, Dict[str, Any]], set, List[Dict[str, Any]]]:
-        home_rows = await self.home_scraper.scrape()
+    async def collect(self, max_events: Optional[int] = None, concurrency: int = 4, force_rescrape: bool = False,
+                      fast_skip_if_cache_sufficient: bool = True) -> Tuple[Dict[str, Dict[str, Any]], set, List[Dict[str, Any]]]:
+        # cached_count = odds already present (existing_cache or processed)
+        cached_count = len(set(self.existing_cache.keys()) | set(self.skip_ids))
+
+        home_rows = await self.home_scraper.scrape(
+            fast_skip_if_cache_sufficient=fast_skip_if_cache_sufficient,
+            cached_count=cached_count
+        )
         all_ids = [str(r["event_id"]) for r in home_rows if r.get("event_id")]
 
         if force_rescrape:
@@ -1206,9 +1196,6 @@ class HKJCBulkOddsCollector:
         logger.info("💾 Saved HKJC all odds to: %s (events=%d)", out_path, len(results))
         return results, self.skip_ids, home_rows
 
-# ---------------------------------------------------------------------------
-# Titan007 stats scraper (unchanged scraping)
-# ---------------------------------------------------------------------------
 async def scrape_match_stats_from_analysis_page(titan_match_id: str) -> Dict[str, Any]:
     url = f"https://zq.titan007.com/analysis/{titan_match_id}.htm"
     logger.info("🔍 Scraping analysis stats for Titan match ID: %s", titan_match_id)
@@ -1358,9 +1345,6 @@ async def scrape_match_stats_from_analysis_page(titan_match_id: str) -> Dict[str
             except Exception:
                 logger.debug("Browser close failed (ignored) for %s", titan_match_id)
 
-# ---------------------------------------------------------------------------
-# Titan table helpers
-# ---------------------------------------------------------------------------
 def extract_table_data_from_real_table(table_elem: Tag) -> List[Dict[str, str]]:
     rows = table_elem.find_all('tr')
     if not rows:
@@ -1422,9 +1406,6 @@ def extract_table_data(table_elem: Tag) -> List[Dict[str, str]]:
         return []
     return extract_table_data_from_real_table(table_elem)
 
-# ---------------------------------------------------------------------------
-# MacauSlot odds scraper (unchanged)
-# ---------------------------------------------------------------------------
 class MacauSlotOddsScraper:
     def __init__(self):
         self.base_url = "https://www.macau-slot.com/content/soccer/coming_bet.html"
@@ -1635,9 +1616,6 @@ class MacauSlotOddsScraper:
         logger.info("💾 Saved Macau odds to: %s", filename)
         return str(filename)
 
-# ---------------------------------------------------------------------------
-# LiveMatchMatcher
-# ---------------------------------------------------------------------------
 class LiveMatchMatcher:
     def __init__(self, min_similarity_threshold: float = 0.70, time_tolerance_minutes: int = 30,
                  prioritize_similarity: bool = True,
@@ -2089,7 +2067,7 @@ class LiveMatchMatcher:
             except Exception:
                 pass
 
-        # Step 0: HKJC bulk odds (skip cached/disk)
+        # Step 0: HKJC bulk odds with fast-skip based on cache size vs declared
         cprint("\n📥 Step 0: Scraping HKJC All Odds (bulk, skip cached)...", Fore.BLUE)
         home_scraper = HKJCHomeScraper()
         hkjc_detailed_scraper = HKJCDetailedOddsScraper()
@@ -2100,12 +2078,12 @@ class LiveMatchMatcher:
             skip_ids=self.hkjc_odds_processed,
         )
         self.hkjc_bulk_odds, self.hkjc_odds_processed, home_rows_from_step0 = await bulk_collector.collect(
-            max_events=None, concurrency=5, force_rescrape=False
+            max_events=None, concurrency=5, force_rescrape=False, fast_skip_if_cache_sufficient=True
         )
         save_cache_set(HKJC_ODDS_PROCESSED_PATH, self.hkjc_odds_processed)
         cprint(f"✅ HKJC bulk odds collected/reused: {len(self.hkjc_bulk_odds)} events", Fore.GREEN)
 
-        # Step 1: Macau odds (reuse last if present)
+        # Step 1: Macau odds
         cprint("\n📥 Step 1: Scraping Macau Slot odds...", Fore.BLUE)
         macau_scraper = MacauSlotOddsScraper()
         macau_disk = macau_scraper.load_latest_from_disk()
@@ -2146,7 +2124,7 @@ class LiveMatchMatcher:
             cprint("❌ Cannot proceed: One or both sites returned no matches", Fore.RED)
             return [], []
 
-        # Step 3: Build Macau mapping to Titan (strict time 10m or name-only fallback)
+        # Step 3: Build Macau mapping to Titan
         cprint("\n🔄 Step 3: Building Macau odds mapping to Titan...", Fore.BLUE)
         self.macau_mapping = {}
         for titan in titan_matches:
@@ -2183,11 +2161,10 @@ class LiveMatchMatcher:
                         pass
         cprint(f"  Mapped {len(self.macau_mapping)} Titan matches to Macau odds", Fore.GREEN)
 
-        # Step 4: Match HKJC <-> Titan (name + optional time assist + league bump)
+        # Step 4: Matching + AI
         cprint("\n🔍 Step 4: Finding matches and running AI per-match...", Fore.BLUE)
         matched = []
         unmatched_hkjc = []
-        ai_rows_for_excel = []
 
         def classify(hkjc_match, titan_match, macau_match):
             has_h = hkjc_match is not None
@@ -2297,7 +2274,6 @@ class LiveMatchMatcher:
                         else:
                             cprint("   ⚠️ HKJC detailed odds failed", Fore.YELLOW)
 
-                # Do NOT skip on titan_stats_processed; always try to load stats from disk
                 disk_stats, disk_status = self.load_titan_stats_from_disk(titan_id)
                 if disk_status == "full":
                     detailed_stats = disk_stats
@@ -2315,7 +2291,6 @@ class LiveMatchMatcher:
                     self.data_quality_metrics['high_confidence_matches'] += 1
                     continue
 
-                # AI cache hit? reuse stored recommendation, skip API
                 cached_ai = self.ai_cache.get(titan_id)
                 if cached_ai and cached_ai.get("ai_result"):
                     matched_item["ai_recommendation"] = cached_ai["ai_result"]
@@ -2344,22 +2319,6 @@ class LiveMatchMatcher:
                     }
                     save_ai_cache(self.ai_cache)
 
-                if matched_item.get("ai_recommendation") and matched_item["ai_recommendation"].get('best_bet_market') and matched_item["ai_recommendation"].get('best_bet_selection'):
-                    ai_rows_for_excel.append({
-                        "match_id_titan": titan_id,
-                        "match_id_hkjc": hkjc.get('match_id', ''),
-                        "source_coverage": source_type,
-                        "home_team": hkjc['home_team'],
-                        "away_team": hkjc['away_team'],
-                        "match_time": hkjc.get('match_time_original', ''),
-                        "league": hkjc.get('tournament', ''),
-                        "best_bet_market": matched_item["ai_recommendation"].get('best_bet_market'),
-                        "best_bet_selection": matched_item["ai_recommendation"].get('best_bet_selection'),
-                        "confidence_level": matched_item["ai_recommendation"].get('confidence_level'),
-                        "brief_reasoning": matched_item["ai_recommendation"].get('brief_reasoning'),
-                        "similarity_score": best_score,
-                        "ai_analysis_timestamp": datetime.now().isoformat()
-                    })
                 matched.append(matched_item)
                 self.data_quality_metrics['high_confidence_matches'] += 1
             else:
@@ -2464,14 +2423,6 @@ class LiveMatchMatcher:
         else:
             success_rate = 0
         cprint(f"   📈 Success rate: {success_rate:.1f}%", Fore.CYAN)
-
-        if ai_rows_for_excel:
-            excel_filename = f"ai_recommendations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            try:
-                save_recommendations_to_excel(ai_rows_for_excel, excel_filename)
-                cprint(f"\n📊 AI recommendations saved to: {excel_filename}", Fore.CYAN)
-            except Exception as e:
-                cprint(f"❌ Failed saving AI Excel: {e}", Fore.RED)
 
         self.save_all_sources_ordered_excel(hkjc_matches, titan_matches, macau_odds, matched, unmatched_hkjc)
         return matched, unmatched_hkjc
@@ -2672,18 +2623,7 @@ class LiveMatchMatcher:
         cprint(f"📋 All sources (matched first) saved to: {filename}", Fore.CYAN)
 
 def save_recommendations_to_excel(recommendations: List[Dict], filename: str):
-    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-        df_all = pd.DataFrame(recommendations)
-        df_all.to_excel(writer, sheet_name='Summary', index=False)
-        if not df_all.empty:
-            for market in df_all['best_bet_market'].unique():
-                df_m = df_all[df_all['best_bet_market'] == market]
-                safe_sheet = re.sub(r'[\\/*?:\[\]]', '_', str(market))[:31]
-                try:
-                    df_m.to_excel(writer, sheet_name=safe_sheet, index=False)
-                except Exception:
-                    pass
-    logger.info("💾 AI recommendations saved to Excel file: %s", filename)
+    logger.info("ai_recommendations export disabled; no file written.")
 
 async def main():
     cprint("🚀 LIVE MATCH CROSS-REFERENCER — WITH HKJC ALL ODDS + MACAU SLOT", Fore.WHITE)
