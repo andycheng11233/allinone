@@ -874,8 +874,15 @@ class HKJCDetailedOddsScraper:
 # ---------------------------------------------------------------------------
 class HKJCHomeScraper:
     """
-    Scrapes HKJC home pages to collect /allodds/<event_id> links and embedded ids.
-    Uses only bet.hkjc.com (Speedbet removed).
+    Scrapes HKJC home page to collect event IDs by interacting with match rows.
+    
+    Uses validated scraper logic:
+    - Loads https://bet.hkjc.com/ch/football/home
+    - Repeatedly clicks "顯示更多" until row count stops growing or declared count is reached
+    - Skips already-started games based on .date text (format %d/%m/%Y %H:%M)
+    - Tries multiple triggers per row (title contains 賠率/所有賠率, .teamIconSmall, .team)
+    - Uses Ctrl/Cmd-click to open odds pages
+    - Captures /allodds/ URLs from network requests and popup URLs
     """
     def __init__(self, urls=None):
         if urls is None:
@@ -883,8 +890,39 @@ class HKJCHomeScraper:
                 "https://bet.hkjc.com/ch/football/home",
             ]
         self.urls = urls
+        self.dt_format = "%d/%m/%Y %H:%M"
+        self.rows_selector = ".match-row,.event-row"
+        self.pause = 0.6
+        self.click_wait = 2.0
+        self.timeout_ms = 12000
 
-    async def _click_show_more(self, page):
+    def _parse_row_start(self, txt: str) -> Optional[datetime]:
+        """Parse match start time from date text."""
+        try:
+            return datetime.strptime(txt.strip(), self.dt_format)
+        except Exception:
+            return None
+
+    def _extract_id_from_url(self, url: str) -> Optional[str]:
+        """Extract event ID from /allodds/ URL."""
+        m = re.search(r"/allodds/(\d+)", url)
+        return m.group(1) if m else None
+
+    async def _get_declared_count(self, page) -> Optional[int]:
+        """Get the declared number of matches from the page."""
+        html = await page.content()
+        m = re.search(r"共有\s*(\d+)\s*場賽事", html)
+        return int(m.group(1)) if m else None
+
+    async def _scroll_bottom(self, page):
+        """Scroll to bottom of page to load lazy content."""
+        await page.mouse.wheel(0, 1800)
+        await asyncio.sleep(self.pause)
+        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(self.pause)
+
+    async def _click_show_more_once(self, page) -> bool:
+        """Click the 'Show More' button if visible."""
         xpaths = [
             "//div[contains(text(), '顯示更多')]",
             "//button[contains(text(), '顯示更多')]",
@@ -893,32 +931,34 @@ class HKJCHomeScraper:
         ]
         for xp in xpaths:
             try:
-                els = await page.query_selector_all(f"xpath={xp}")
-                for el in els:
+                for el in await page.query_selector_all(f"xpath={xp}"):
                     if await el.is_visible():
                         await el.scroll_into_view_if_needed()
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(0.2)
                         await el.click()
-                        await asyncio.sleep(1.2)
+                        await asyncio.sleep(0.8)
                         return True
             except Exception:
                 continue
         return False
 
-    async def _scroll_home_page(self, page, max_attempts: int = 12, pause: float = 0.8):
-        last_height = await page.evaluate("() => document.body.scrollHeight")
-        for _ in range(max_attempts):
-            await page.mouse.wheel(0, 1400)
-            await asyncio.sleep(pause)
-            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(pause)
-            new_height = await page.evaluate("() => document.body.scrollHeight")
-            if new_height <= last_height + 20:
-                break
-            last_height = new_height
-
     async def _scrape_one(self, url: str) -> List[Dict[str, Any]]:
+        """
+        Scrape event IDs from HKJC home page using interactive method.
+        
+        This method:
+        1. Sets up network monitoring to capture /allodds/ URLs
+        2. Loads the page and clicks "Show More" to reveal all matches
+        3. Iterates through match rows
+        4. Skips already-started games based on date
+        5. Tries multiple triggers (odds links, team icons) with Ctrl/Cmd-click
+        6. Captures event IDs from popup URLs or navigation
+        """
+        import sys
+        
         results: List[Dict[str, Any]] = []
+        now = datetime.now()
+        
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
@@ -929,57 +969,148 @@ class HKJCHomeScraper:
                 )
             )
             page = await context.new_page()
+            
+            # Track captured event IDs from network
+            collected = set()
+            mod_key = ["Meta"] if sys.platform == "darwin" else ["Control"]
+            
+            def log_url(url_str: str):
+                eid = self._extract_id_from_url(url_str)
+                if eid:
+                    collected.add(eid)
+                    logger.debug("Captured via network: %s", eid)
+            
+            # Monitor network for /allodds/ URLs
+            context.on("request", lambda req: log_url(req.url))
+            context.on("response", lambda resp: log_url(resp.url))
+            
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=90000)
-                await asyncio.sleep(2.0)
-                await self._scroll_home_page(page, max_attempts=14, pause=0.8)
-                await self._click_show_more(page)
-                await self._scroll_home_page(page, max_attempts=12, pause=0.8)
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(2.0)
-                html = await page.content()
+                await asyncio.sleep(1.0)
+                
+                # Get declared count and click show more
+                declared = await self._get_declared_count(page)
+                logger.info("Declared matches: %s", declared if declared else "not found")
+                
+                await self._click_show_more_once(page)
+                await self._scroll_bottom(page)
+                
+                # Check if we need more scrolling
+                row_count = await page.evaluate(f"() => document.querySelectorAll('{self.rows_selector}').length")
+                if declared and row_count < declared:
+                    await self._scroll_bottom(page)
+                
+                # Get all rows
+                rows = page.locator(self.rows_selector)
+                total = await rows.count()
+                logger.info("Row count: %d", total)
+                
+                # Process each row
+                for i in range(total):
+                    row = rows.nth(i)
+                    try:
+                        # Get row ID
+                        rid = (await row.get_attribute("id")) or ""
+                        if not rid:
+                            try:
+                                rid = await row.locator(".fb-id").first.text_content()
+                            except Exception:
+                                rid = ""
+                        rid = (rid or "").strip()
+                        
+                        # Check if game already started
+                        try:
+                            dt_txt = await row.locator(".date").first.text_content()
+                            start_dt = self._parse_row_start(dt_txt or "")
+                            if start_dt and start_dt <= now:
+                                logger.debug("[%d/%d] %s skip (started)", i+1, total, rid)
+                                continue
+                        except Exception:
+                            pass
+                        
+                        # Find a trigger element to click
+                        trigger = None
+                        for sel in [
+                            '[title*="賠率"]',
+                            '[title*="所有賠率"]',
+                            ".teamIconSmall [title]",
+                            ".teamIconSmall",
+                            ".team",
+                        ]:
+                            cand = row.locator(sel)
+                            if await cand.count():
+                                trigger = cand.first
+                                logger.debug("[%d/%d] %s using selector: %s", i+1, total, rid, sel)
+                                break
+                        
+                        if not trigger:
+                            logger.debug("[%d/%d] %s no trigger found", i+1, total, rid)
+                            continue
+                        
+                        # Try to click with modifier key to open in new tab/window
+                        pages_before = set(context.pages)
+                        try:
+                            await trigger.click(modifiers=mod_key, force=True)
+                        except Exception as e:
+                            logger.debug("[%d/%d] %s click error: %s", i+1, total, rid, e)
+                        
+                        await asyncio.sleep(self.click_wait)
+                        
+                        # Check for new popup or navigation
+                        pages_after = set(context.pages)
+                        new_pages = list(pages_after - pages_before)
+                        url_captured = None
+                        
+                        if new_pages:
+                            # New tab/window opened
+                            np = new_pages[0]
+                            try:
+                                await np.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+                            except Exception:
+                                pass
+                            url_captured = np.url
+                            logger.debug("[%d/%d] %s popup URL: %s", i+1, total, rid, url_captured)
+                            try:
+                                await np.close()
+                            except Exception:
+                                pass
+                        else:
+                            # Check if same page navigated
+                            if self._extract_id_from_url(page.url):
+                                url_captured = page.url
+                                logger.debug("[%d/%d] %s same-page URL: %s", i+1, total, rid, url_captured)
+                                try:
+                                    await page.go_back()
+                                except Exception:
+                                    pass
+                        
+                        # Extract event ID from captured URL
+                        if url_captured:
+                            eid = self._extract_id_from_url(url_captured)
+                            if eid:
+                                collected.add(eid)
+                                logger.debug("[%d/%d] %s captured ID: %s", i+1, total, rid, eid)
+                    
+                    except Exception as e:
+                        logger.debug("[%d/%d] error: %s", i+1, total, e)
+                
             finally:
                 await browser.close()
-
-        soup = BeautifulSoup(html, "html.parser")
-        candidates = []
-        # href-based
-        for a in soup.find_all("a", href=True):
-            m = re.search(r"/allodds/(\d+)", a["href"])
-            if m:
-                eid = m.group(1)
-                candidates.append((eid, a.get_text(" ", strip=True), a))
-        # data-attr based
-        for el in soup.find_all(True):
-            eid = el.get("data-eventid") or el.get("data-event-id") or el.get("data-event")
-            if eid and re.match(r"^\d+$", eid):
-                candidates.append((eid, el.get_text(" ", strip=True), el))
-        # tvChannels class-based
-        for m in re.finditer(r'class="[^"]*\btvChannels\s+(\d+)\b', html):
-            eid = m.group(1)
-            candidates.append((eid, "", None))
-
-        seen = set()
-        rows = []
-        for eid, txt, node in candidates:
-            if eid in seen:
-                continue
-            seen.add(eid)
-            home = away = None
-            text_block = txt or ""
-            m_vs = re.split(r"\s+vs\s+|\s+VS\s+|\s+對\s+|\s+v\s+", text_block)
-            if len(m_vs) >= 2:
-                home, away = m_vs[0].strip(), m_vs[1].strip()
-            rows.append({
+        
+        # Convert collected IDs to result format
+        for eid in sorted(collected):
+            results.append({
                 "event_id": eid,
-                "home_team": home,
-                "away_team": away,
-                "raw_text": text_block
+                "home_team": None,
+                "away_team": None,
+                "raw_text": ""
             })
-        logger.info("HKJCHomeScraper %s collected %d event ids", url, len(rows))
-        return rows
+        
+        logger.info("HKJCHomeScraper %s collected %d event ids", url, len(results))
+        return results
 
     async def scrape(self) -> List[Dict[str, Any]]:
+        """Scrape all configured URLs and return deduplicated results."""
         all_rows: List[Dict[str, Any]] = []
         for u in self.urls:
             rows = await self._scrape_one(u)
