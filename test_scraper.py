@@ -9,10 +9,6 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Import the scraper from all2a
-# Note: We'll import the class directly by executing the file
-import importlib.util
-
 def load_module_from_file(filepath):
     """Load a Python module from a file path."""
     # Read and compile the file
