@@ -186,19 +186,6 @@ def find_best_float_in_text(text: str, min_val: float = -1e9, max_val: float = 1
             return v
     return None
 
-def parse_decimal_tokens_from_concatenated(text: str) -> List[float]:
-    if not text:
-        return []
-    tokens = re.findall(r'\d{1,2}\.\d{1,2}', text)
-    floats = []
-    for t in tokens:
-        try:
-            v = float(t)
-            if 0.0 <= v <= 10.0:
-                floats.append(v)
-        except ValueError:
-            continue
-    return floats
 
 
 async def call_deepseek_api_async(prompt: str, timeout: int = None, max_retries: int = None) -> str:
