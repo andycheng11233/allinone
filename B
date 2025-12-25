@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-Titan pre-scrape: discover match IDs from live.titan007.com, then scrape stats pages.
-
-Outputs (flat layout, no date subfolder):
-  titan/stats/full/<match_id>.json               # usable stats
-  titan/stats/incomplete/<match_id>.json         # has data but not enough sections/keys (or still retrying)
-  titan/stats/completelymissing/<match_id>.json  # no stats after 3 attempts; skip future runs
-  titan/html/<match_id>.html                     # if --save-html
-
-Behavior:
-- Skip only when attempts >= 3 (whether previously in incomplete/ or completelymissing/).
-- Retry all others (new or attempts < 3).
-- After scrape: if full -> full/, if empty and attempts >= 3 -> completelymissing/, else -> incomplete/.
-"""
-
 import argparse
 import asyncio
 import json
@@ -21,148 +5,206 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from bs4 import BeautifulSoup, Tag
 from playwright.async_api import async_playwright
+import openpyxl
+from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("titan_pre_scrape")
+logger = logging.getLogger("titan_stat_main")
 
 INDEX_URL = "https://live.titan007.com/indexall_big.aspx"
+GAME_FILE = "game.json"
 
-# ---------------- Titan stats scraper ----------------
-async def titan_scrape_stats(match_id: str, save_html: bool = False, page=None) -> Dict[str, Any]:
+BAD_STRING = "暫無數據"
+MIN_SECTIONS_FOR_FULL = 3  # Amount required to call match 'full'--adjust as needed.
+
+SECTIONS_TO_TRY = [
+    ("league_standings",           r"聯賽積分排名"),
+    ("head_to_head",               r"對賽往績"),
+    ("data_comparison",            r"數據對比"),
+    ("referee_stats",              r"裁判統計"),
+    ("league_trend",               r"聯賽盤路走勢"),
+    ("same_trend",                 r"相同盤路"),
+    ("goal_distribution",          r"入球數/上下半場入球分布"),
+    ("halftime_fulltime",          r"半全場"),
+    ("goal_count",                 r"進球數/單雙"),
+    ("goal_time",                  r"進球時間"),
+    ("future_matches",             r"未來五場"),
+    ("pre_match_brief",            r"賽前簡報"),
+    ("season_stats_comparison",    r"本賽季數據統計比較"),
+    ("recent_form",                r"近期戰績"),
+    ("last_match_player_ratings",  r"球員上一場出場評分"),
+    ("lineup_and_injuries",        r"陣容情況"),
+    ("pre_match_table",            r"賽前積分榜"),
+]
+
+def load_gamejson():
+    with open(GAME_FILE, encoding="utf-8") as f:
+        ls = json.load(f)
+    gids = set(x["SclassID"] for x in ls)
+    subids = set(x["SubID"] for x in ls if x.get("SubID"))
+    simp_trad = set()
+    for x in ls:
+        simp_trad.add(x["simp"])
+        simp_trad.add(x["trad"])
+    return gids, subids, simp_trad
+
+async def filter_match_ids_only_my_leagues(all_match_ids):
+    gids, subids, names = load_gamejson()
+    filtered = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(INDEX_URL)
+        await page.wait_for_timeout(2_200)
+
+        mapping = await page.evaluate("""
+            () => {
+              let out = {};
+              let sources = [window.A, window.arr, window.matchList, window.B, window.C, window.Match];
+              for (const src of sources) {
+                if (Array.isArray(src)) {
+                  for (const row of src) {
+                    if (!row) continue;
+                    let mid = String(row[0] || row.matchid || row.MatchID || row.matchId || row.id || "");
+                    let sclassid = String(row[2] || row[4] || row.sclassid || row.SclassID || row.sclassID || "");
+                    let subid = String(row[9] || row.subid || row.SubID || "");
+                    let simp = row[1] || row.simp || "";
+                    let trad = row[1] || row.trad || "";
+                    out[mid] = { sclassid, subid, simp, trad };
+                  }
+                }
+              }
+              return out;
+            }
+        """)
+        for mid in all_match_ids:
+            if not mid.isdigit():
+                continue
+            info = mapping.get(mid) or {}
+            scid = info.get("sclassid", "")
+            subid = info.get("subid", "")
+            simp = info.get("simp", "")
+            trad = info.get("trad", "")
+            if scid in gids or (subid and subid in subids) or simp in names or trad in names:
+                filtered.append(mid)
+                continue
+            tr = await page.query_selector(f'tr[id="tr1_{mid}"]')
+            if tr:
+                tds = await tr.query_selector_all("td")
+                league_name = (await tds[1].inner_text()).strip() if len(tds) > 1 else ""
+                if league_name in names:
+                    filtered.append(mid)
+        await browser.close()
+    return filtered
+
+def is_real_data_table(tbl):
+    rows = tbl.find_all("tr")
+    if len(rows) < 2:
+        return False
+    for row in rows:
+        cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
+        for cell in cells:
+            if cell and BAD_STRING not in cell:
+                return True
+    return False
+
+def analyze_sections(html):
+    soup = BeautifulSoup(html, "html.parser")
+    found, missing = [], []
+    debug_info = {}
+    for key, regex in SECTIONS_TO_TRY:
+        header = soup.find(string=re.compile(regex))
+        section_status = "not_found"
+        if header:
+            tbl = header.find_next("table")
+            if tbl and is_real_data_table(tbl):
+                section_status = "real_data"
+                found.append(key)
+            elif tbl:
+                section_status = "only_bad_string"
+                missing.append(key)
+            else:
+                section_status = "table_not_found"
+                missing.append(key)
+        else:
+            missing.append(key)
+        debug_info[key] = section_status
+    return found, missing, debug_info
+
+async def titan_scrape_stats(match_id: str):
     url = f"https://zq.titan007.com/analysis/{match_id}.htm"
     out = {
         "match_id": match_id,
         "url": url,
         "scraped_at": datetime.now().isoformat(),
-        "sections": {},
-        "stats_available": False,
+        "sections_found": [],
+        "sections_missing": [],
+        "sections_debug": {},
+        "has_stats": False,
+        "home_team": "",
+        "away_team": "",
+        "game_time": "",
+        "league": "",
     }
-
-    own_browser = None
-    own_page = False
-    try:
-        if page is None:
-            own_page = True
-            async with async_playwright() as p:
-                own_browser = await p.chromium.launch(headless=True)
-                page = await own_browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(3.0)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
         try:
-            await page.wait_for_selector("table", timeout=3000)
-        except Exception:
-            pass
-        html = await page.content()
-    except Exception as e:
-        logger.exception("Fetch error for %s: %s", match_id, e)
-        out["error"] = str(e)
-        return out
-    finally:
-        if own_page and own_browser:
-            try:
-                await own_browser.close()
-            except Exception:
-                pass
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(2.5)
+            html = await page.content()
+        except Exception as e:
+            out["error"] = str(e)
+            await browser.close()
+            return out
+        await browser.close()
 
+    found, missing, debug = analyze_sections(html)
+    out["sections_found"] = found
+    out["sections_missing"] = missing
+    out["sections_debug"] = debug
+    out["has_stats"] = len(found) >= MIN_SECTIONS_FOR_FULL
+
+    # Title parsing (as before)
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(separator=" ", strip=True)
-    if any(bad in text for bad in ["暫無數據", "數據統計中", "資料準備中", "未開始", "尚無相關資料", "No data"]):
-        out["error"] = "No stats on page"
-        if save_html:
-            out["html"] = html
-        return out
+    m = re.search(r"(.+?) vs (.+?)[\s|【]", soup.title.string if soup.title else "")
+    if m:
+        out["home_team"] = m.group(1).strip()
+        out["away_team"] = m.group(2).strip()
+    info_div = soup.find("div", {"class": "jifen_header"})
+    if info_div:
+        info_text = info_div.get_text(separator=" ", strip=True)
+        mtime = re.search(r"\d{2}:\d{2}", info_text)
+        if mtime:
+            out["game_time"] = mtime.group()
+        mleague = re.search(r".*?联.*? ", info_text)
+        if mleague:
+            out["league"] = mleague.group().strip()
 
-    sections_to_try = [
-        ("league_standings", r"聯賽積分排名"),
-        ("head_to_head", r"對賽往績"),
-        ("data_comparison", r"數據對比"),
-        ("referee_stats", r"裁判統計"),
-        ("league_trend", r"聯賽盤路走勢"),
-        ("same_trend", r"相同盤路"),
-        ("goal_distribution", r"入球數/上下半場入球分布"),
-        ("halftime_fulltime", r"半全場"),
-        ("goal_count", r"進球數/單雙"),
-        ("goal_time", r"進球時間"),
-        ("future_matches", r"未來五場"),
-        ("pre_match_brief", r"賽前簡報"),
-        ("season_stats_comparison", r"本賽季數據統計比較"),
-        ("recent_form", r"近期戰績"),
-        ("last_match_player_ratings", r"球員上一場出場評分"),
-        ("lineup_and_injuries", r"陣容情況"),
-        ("goal_count_odd_even", r"進球數/單雙"),  # alias
-    ]
-
-    def extract_table_data(tbl: Tag) -> List[Dict[str, str]]:
-        rows = tbl.find_all("tr")
-        if len(rows) < 2:
-            return []
-        headers = [re.sub(r"\s+", " ", c.get_text(strip=True)) or f"col_{i}" for i, c in enumerate(rows[0].find_all(["th", "td"]))]
-        data = []
-        for row in rows[1:]:
-            cells = row.find_all(["td", "th"])
-            if not cells:
-                continue
-            row_data = {}
-            for i, cell in enumerate(cells[: len(headers)]):
-                txt = re.sub(r"\s+", " ", cell.get_text(strip=True))
-                if txt:
-                    row_data[headers[i]] = txt
-            if row_data:
-                data.append(row_data)
-        return data
-
-    def extract_section_by_regex(sp: BeautifulSoup, regex: str) -> Tuple[Optional[Any], bool]:
-        header = sp.find(string=re.compile(regex))
-        if not header:
-            return None, False
-        next_table = header.find_next("table")
-        if next_table:
-            parsed = extract_table_data(next_table)
-            if parsed and len(parsed[0].keys()) >= 1:
-                return parsed, True
-        for tbl in header.find_all_next("table", limit=3):
-            parsed = extract_table_data(tbl)
-            if parsed and len(parsed[0].keys()) >= 1:
-                return parsed, True
-        parent = header.find_parent() if hasattr(header, "find_parent") else getattr(header, "parent", None)
-        if parent:
-            txt = parent.get_text(separator=" | ", strip=True)
-            if txt and len(txt) > 30:
-                return [{"text_content": txt}], False
-        return None, False
-
-    sections_found = 0
-    for key, regex in sections_to_try:
-        sec, has_tbl = extract_section_by_regex(soup, regex)
-        if sec:
-            out["sections"][key] = sec
-            if has_tbl:
-                sections_found += 1
-
-    formation_header = soup.find(string=re.compile(r"陣容情況"))
-    if formation_header:
-        parent = formation_header.find_parent() if hasattr(formation_header, "find_parent") else getattr(formation_header, "parent", None)
-        if parent:
-            out["sections"]["team_formation"] = parent.get_text(separator=" | ", strip=True)
-            sections_found += 1
-
-    out["stats_available"] = sections_found > 0
-    if save_html:
-        out["html"] = html
     return out
 
-# ---------------- Discovery ----------------
+def excel_add_rows(excel_path, rows, headers):
+    if not Path(excel_path).exists():
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(headers)
+        wb.save(excel_path)
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb.active
+    for row in rows:
+        ws.append(row)
+    wb.save(excel_path)
+
 async def discover_match_ids(limit: Optional[int]) -> List[str]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         await page.goto(INDEX_URL, wait_until="domcontentloaded", timeout=60000)
-        await asyncio.sleep(4.0)  # allow JS to populate globals
-
+        await asyncio.sleep(4.0)
         ids = await page.evaluate(
             """
             () => {
@@ -187,11 +229,9 @@ async def discover_match_ids(limit: Optional[int]) -> List[str]:
             }
             """
         )
-
         await browser.close()
-
-    seen = set()
     uniq = []
+    seen = set()
     for mid in ids:
         if mid not in seen:
             seen.add(mid)
@@ -201,180 +241,54 @@ async def discover_match_ids(limit: Optional[int]) -> List[str]:
     logger.info("Discovered %d match ids from live page (limit=%s)", len(uniq), limit)
     return uniq
 
-# ---------------- Gate: is_full ----------------
-def load_required_keys_from_template(template_path: Optional[str]) -> List[str]:
-    if not template_path:
-        return []
-    try:
-        tmpl = json.loads(Path(template_path).read_text(encoding="utf-8"))
-        if isinstance(tmpl, dict):
-            return list((tmpl.get("sections") or {}).keys())
-    except Exception:
-        pass
-    return []
-
-def _has_content(v: Any) -> bool:
-    if isinstance(v, list):
-        return len(v) > 0
-    if isinstance(v, str):
-        return bool(v.strip())
-    return bool(v)
-
-def is_full_stats(data: Dict[str, Any], min_sections: int, required_keys: List[str]) -> bool:
-    sections = data.get("sections") or {}
-    if not sections:
-        return False
-
-    non_empty = sum(1 for v in sections.values() if _has_content(v))
-    # Require at least min_sections non-empty sections (default 1); never less than 1
-    if non_empty < max(1, min_sections):
-        return False
-
-    # Enforce required keys only if provided, and require they have content
-    for rk in required_keys:
-        if rk:
-            v = sections.get(rk)
-            if v is None or not _has_content(v):
-                return False
-
-    return True
-
-# ---------------- Output helpers ----------------
-def get_attempts(existing_path: Path) -> int:
-    if not existing_path.exists():
-        return 0
-    try:
-        data = json.loads(existing_path.read_text(encoding="utf-8"))
-        return int(data.get("attempts", 0))
-    except Exception:
-        return 0
-
-async def handle_result(
-    match_id: str,
-    data: Dict[str, Any],
-    base: Path,
-    save_html: bool,
-    min_sections: int,
-    required_keys: List[str],
-    prev_attempts: int,
-) -> None:
-    full_dir = base / "full"
-    incomplete_dir = base / "incomplete"
-    missing_dir = base / "completelymissing"
-    html_dir = base.parent / "html"
-
-    full_dir.mkdir(parents=True, exist_ok=True)
-    incomplete_dir.mkdir(parents=True, exist_ok=True)
-    missing_dir.mkdir(parents=True, exist_ok=True)
-    if save_html:
-        html_dir.mkdir(parents=True, exist_ok=True)
-
-    attempts = prev_attempts + 1
-    data["attempts"] = attempts
-
-    is_full = is_full_stats(data, min_sections=min_sections, required_keys=required_keys)
-    is_empty = (not data.get("sections")) and (not data.get("stats_available"))
-
-    # Gate debug log
-    sections = data.get("sections") or {}
-    non_empty = sum(1 for v in sections.values() if _has_content(v))
-    missing_req = [rk for rk in required_keys if rk and (rk not in sections or not _has_content(sections.get(rk)))]
-    logger.info(
-        "Gate check for %s: sections=%d non_empty=%d min_sections=%d required=%s missing_required=%s is_full=%s",
-        match_id, len(sections), non_empty, min_sections, required_keys, missing_req, is_full
-    )
-
-    if is_full:
-        target_dir = full_dir
-        status = "FULL"
-    elif is_empty and attempts >= 3:
-        target_dir = missing_dir
-        status = "COMPLETELY MISSING (stop after 3)"
-    else:
-        target_dir = incomplete_dir
-        status = "INCOMPLETE"
-
-    out_path = target_dir / f"{match_id}.json"
-    out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("%s stats: %s (attempt %d)", status, out_path, attempts)
-
-    if save_html and "html" in data:
-        (html_dir / f"{match_id}.html").write_text(data["html"], encoding="utf-8")
-
-# ---------------- Bounded scraping ----------------
-async def scrape_all(ids: List[str], save_html: bool, min_sections: int, required_keys: List[str], base: Path, max_concurrent: int = 3):
-    sem = asyncio.Semaphore(max_concurrent)
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-
-        async def scrape_one(mid: str):
-            async with sem:
-                page = await browser.new_page()
-                try:
-                    data = await titan_scrape_stats(mid, save_html=save_html, page=page)
-                    prev_attempts = 0
-                    for folder in ["incomplete", "completelymissing"]:
-                        existing = base / folder / f"{mid}.json"
-                        prev_attempts = max(prev_attempts, get_attempts(existing))
-                    await handle_result(mid, data, base, save_html, min_sections, required_keys, prev_attempts)
-                finally:
-                    await page.close()
-
-        await asyncio.gather(*(scrape_one(mid) for mid in ids))
-        await browser.close()
-
-# ---------------- Main ----------------
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ids", nargs="*", help="Explicit match IDs (skip discovery)")
-    parser.add_argument("--file", help="Text file with match IDs (one per line)")
-    parser.add_argument("--limit", type=int, help="Limit how many IDs from discovery or provided list")
-    parser.add_argument("--save-html", action="store_true", help="Save raw HTML snapshots")
-    parser.add_argument("--min-sections", type=int, default=1, help="Minimum non-empty sections to consider stats usable")
-    parser.add_argument("--required-keys", nargs="*", default=[], help="Section keys required (e.g., data_comparison head_to_head)")
-    parser.add_argument("--template", help="Path to a good sample JSON (e.g., 2784627.json) to derive required keys")
+    parser.add_argument("--limit", type=int, help="Limit how many IDs from discovery")
     parser.add_argument("--base", default="titan/stats", help="Base stats directory (flat layout)")
-    parser.add_argument("--max-concurrent", type=int, default=3, help="Max pages scraping in parallel")
     args = parser.parse_args()
-
-    ids: List[str] = []
-    if args.file:
-        ids.extend([line.strip() for line in Path(args.file).read_text(encoding="utf-8").splitlines() if line.strip()])
-    if args.ids:
-        ids.extend(args.ids)
-
-    if not ids:
-        ids = await discover_match_ids(args.limit)
-    elif args.limit:
-        ids = ids[:args.limit]
-
-    template_keys = load_required_keys_from_template(args.template)
-    required_keys = args.required_keys if args.required_keys else template_keys
 
     base = Path(args.base)
     full_dir = base / "full"
+    missing_dir = base / "missing"
+    full_dir.mkdir(parents=True, exist_ok=True)
+    missing_dir.mkdir(parents=True, exist_ok=True)
 
-    filtered_ids = []
+    ids = await discover_match_ids(args.limit)
+    ids = await filter_match_ids_only_my_leagues(ids)
+    logger.info("Filtered: %d match ids will be scraped.", len(ids))
+
+    missing_rows = []
+    cur_time_tag = datetime.now().strftime("%Y%m%d%H%M")
+    excel_path = Path(f"missing{cur_time_tag}.xlsx")
+
+    headers = ["match_id", "home_team", "away_team", "game_time", "league", "stat_url", "found_sections", "missing_sections"]
+
+    print(f"Ready to process {len(ids)} matches:\n{ids}")
+
     for mid in ids:
-        # skip if already full
-        if (full_dir / f"{mid}.json").exists():
-            logger.info("Skip (already full): %s", mid)
-            continue
-        # check attempts from incomplete and completelymissing
-        prev_attempts = 0
-        for folder in ["incomplete", "completelymissing"]:
-            existing = base / folder / f"{mid}.json"
-            prev_attempts = max(prev_attempts, get_attempts(existing))
-        if prev_attempts >= 3:
-            logger.info("Skip (attempts >= 3): %s", mid)
-            continue
-        filtered_ids.append(mid)
+        print(f"Scraping {mid} ...")
+        out = await titan_scrape_stats(mid)
+        if out.get("has_stats"):
+            (full_dir / f"{mid}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"OK - FULL: {mid}")
+        else:
+            (missing_dir / f"{mid}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"WARNING - MISSING: {mid} | Sections found: {out['sections_found']}")
+            missing_rows.append([
+                out["match_id"],
+                out.get("home_team", ""),
+                out.get("away_team", ""),
+                out.get("game_time", ""),
+                out.get("league", ""),
+                out.get("url"),
+                ";".join(out.get("sections_found") or []),
+                ";".join(out.get("sections_missing") or [])
+            ])
 
-    if not filtered_ids:
-        logger.info("No matches to scrape (all full or max attempts reached).")
-        return
-
-    await scrape_all(filtered_ids, args.save_html, args.min_sections, required_keys, base, max_concurrent=args.max_concurrent)
+    if missing_rows:
+        excel_add_rows(excel_path, missing_rows, headers)
+        logger.info(f"Excel written: {excel_path} ({len(missing_rows)} missing games)")
+    print(f"Completed scrape. {len(missing_rows)} matches missing stats. See Excel/log as configured.")
 
 if __name__ == "__main__":
     asyncio.run(main())
