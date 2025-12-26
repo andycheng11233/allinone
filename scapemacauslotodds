@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""
+First Half Correct Score (上半場波膽) Scraper - Fixed Headless Mode
+Extracts odds from Macau Slot website
+Pattern: 10 pairs of (Home, Away) odds + 6 Home-only odds = 26 total numbers
+"""
+
+import asyncio
+import json
+import csv
+import random
+from pathlib import Path
+from typing import Dict, List, Optional
+from datetime import datetime
+from playwright.async_api import async_playwright
+
+
+class FirstHalfCorrectScoreScraper:
+    def __init__(self, headless: bool = False):
+        self.headless = headless
+        self.output_dir = Path("first_half_correct_score")
+        self.output_dir.mkdir(exist_ok=True)
+
+        # Correct score labels in exact order as displayed
+        self.home_win_scores = ["1:0", "2:0", "2:1", "3:0", "3:1", "3:2",
+                                "4:0", "4:1", "4:2", "4:3"]
+        self.draw_scores = ["0:0", "1:1", "2:2", "3:3", "4:4", "其他"]
+
+        # User agents to rotate (avoid detection)
+        self.user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/120.0"
+        ]
+
+    async def scrape(self):
+        """Main scraping function"""
+        async with async_playwright() as p:
+            # Choose random user agent
+            user_agent = random.choice(self.user_agents)
+
+            # Configure browser for headless mode
+            browser_args = []
+            if self.headless:
+                # Add arguments to make headless browser look more like real browser
+                browser_args = [
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    f"--user-agent={user_agent}"
+                ]
+
+            browser = await p.chromium.launch(
+                headless=self.headless,
+                args=browser_args,
+                slow_mo=100 if not self.headless else 50  # Faster in headless
+            )
+
+            # Create context with proper viewport and user agent
+            context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=user_agent,
+                locale="zh-HK",  # Set to Hong Kong locale
+                timezone_id="Asia/Hong_Kong"
+            )
+
+            # Add extra headers to look more like a real browser
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-HK', 'zh', 'en-US', 'en']
+                });
+            """)
+
+            page = await context.new_page()
+
+            try:
+                # 1. Load the page
+                print("🌐 Loading Macau Slot website...")
+                if self.headless:
+                    print("🔒 Running in stealth headless mode")
+
+                # Navigate with extra wait for headless mode
+                await page.goto(
+                    "https://www.macau-slot.com/content/soccer/coming_bet.html",
+                    timeout=45000 if self.headless else 30000,
+                    wait_until="networkidle"
+                )
+
+                # Extra wait for headless
+                if self.headless:
+                    await asyncio.sleep(3)
+                    # Take a screenshot to debug headless mode
+                    await page.screenshot(path="debug_headless_load.png")
+                    print("📸 Debug screenshot saved: debug_headless_load.png")
+
+                # 2. Click First Half Correct Score (上半場波膽)
+                print("🖱️ Switching to '上半場波膽' market...")
+                success = await self._switch_to_market(page, "上半場波膽")
+
+                if not success:
+                    print("⚠️ Primary method failed, trying alternative...")
+                    success = await self._switch_market_advanced(page, "上半場波膽")
+
+                if not success:
+                    print("❌ Failed to switch market in headless mode")
+                    if self.headless:
+                        print("💡 Try running with visible browser first to confirm the button exists")
+                    return
+
+                # Extra wait for odds to load in headless
+                await asyncio.sleep(3 if self.headless else 2)
+
+                # 3. Get all matches
+                matches = await page.query_selector_all(".msl-ls-item")
+                print(f"📊 Found {len(matches)} matches")
+
+                if not matches:
+                    print("❌ No matches found")
+                    if self.headless:
+                        await page.screenshot(path="debug_no_matches.png")
+                        print("📸 Debug screenshot saved: debug_no_matches.png")
+                    return
+
+                all_results = []
+                max_matches = 3 if self.headless else 5  # Process fewer in headless mode
+
+                for match_idx, match in enumerate(matches[:max_matches]):
+                    print(f"\n{'=' * 60}")
+                    print(f"Processing match {match_idx + 1}/{min(max_matches, len(matches))}")
+                    print('=' * 60)
+
+                    result = await self._process_match(match, match_idx)
+                    if result:
+                        all_results.append(result)
+
+                # 4. Save combined results
+                if all_results:
+                    await self._save_combined_results(all_results)
+                    print(f"\n✅ Successfully processed {len(all_results)} matches")
+                else:
+                    print("\n❌ No matches were successfully processed")
+                    if self.headless:
+                        await page.screenshot(path="debug_no_results.png")
+                        print("📸 Debug screenshot saved: debug_no_results.png")
+
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                import traceback
+                traceback.print_exc()
+
+                if self.headless:
+                    # Save error screenshot
+                    try:
+                        await page.screenshot(path="error_screenshot.png")
+                        print("📸 Error screenshot saved: error_screenshot.png")
+                    except:
+                        pass
+
+            finally:
+                if not self.headless:
+                    print("\n" + "=" * 60)
+                    print("Scraping complete!")
+                    print(f"Results saved to: {self.output_dir}")
+                    print("\nPress Enter to close browser...")
+                    input()
+                await browser.close()
+
+    async def _switch_market_advanced(self, page, market_text: str) -> bool:
+        """Advanced method to switch markets (works better in headless)"""
+        try:
+            # Method 1: Try to find and click using JavaScript
+            clicked = await page.evaluate(f"""
+                (marketText) => {{
+                    const buttons = Array.from(document.querySelectorAll('li.msl-cm-methods, li.market-tab'));
+                    const targetBtn = buttons.find(btn => btn.textContent.includes(marketText));
+                    if (targetBtn) {{
+                        targetBtn.click();
+                        return true;
+                    }}
+                    return false;
+                }}
+            """, market_text)
+
+            if clicked:
+                print(f"✅ Switched to '{market_text}' (JavaScript method)")
+                return True
+
+            # Method 2: Try to find by XPath
+            xpath = f"//li[contains(text(), '{market_text}')]"
+            try:
+                element = await page.wait_for_selector(xpath, timeout=3000)
+                if element:
+                    await element.click()
+                    print(f"✅ Switched to '{market_text}' (XPath method)")
+                    return True
+            except:
+                pass
+
+            # Method 3: Look for any button with partial text
+            buttons = await page.query_selector_all("li, button, div[role='button']")
+            for btn in buttons:
+                try:
+                    text = await btn.text_content() or ""
+                    if market_text in text:
+                        await btn.click()
+                        print(f"✅ Switched to '{market_text}' (partial text match)")
+                        return True
+                except:
+                    continue
+
+            return False
+
+        except Exception as e:
+            print(f"⚠️ Advanced switch error: {e}")
+            return False
+
+    async def _switch_to_market(self, page, market_text: str) -> bool:
+        """Switch to specified market tab"""
+        try:
+            # Wait for market buttons to be visible
+            await page.wait_for_selector("li.msl-cm-methods", timeout=5000)
+
+            # Try direct click first
+            await page.click(f"text={market_text}", timeout=3000)
+            print(f"✅ Switched to '{market_text}' market")
+            return True
+        except:
+            # Fallback: find button by text
+            try:
+                buttons = await page.query_selector_all("li.msl-cm-methods")
+                for btn in buttons:
+                    text = await btn.text_content() or ""
+                    if market_text in text:
+                        await btn.click()
+                        print(f"✅ Switched to '{market_text}' (fallback method)")
+                        return True
+            except:
+                pass
+            return False
+
+    async def _process_match(self, match, match_idx: int) -> Optional[Dict]:
+        """Process a single match"""
+        try:
+            # Get basic match info
+            event_id = await match.get_attribute("data-ev-id") or f"match_{match_idx}"
+
+            # Scroll the match into view (important for headless)
+            await match.scroll_into_view_if_needed()
+            await asyncio.sleep(0.5)
+
+            # Extract all text
+            all_text = await match.text_content()
+            lines = [line.strip() for line in all_text.split('\n') if line.strip()]
+
+            if len(lines) < 25:  # Reduced threshold for headless
+                print(f"⚠️ Match {event_id}: Insufficient data ({len(lines)} lines)")
+                # Try to get inner HTML as fallback
+                html = await match.inner_html()
+                if len(html) < 500:
+                    return None
+
+            # Extract team names
+            home_team, away_team = self._extract_teams(lines)
+
+            # Extract all odds numbers
+            odds_numbers = self._extract_odds_numbers(lines)
+
+            if len(odds_numbers) < 26:
+                print(f"⚠️ Match {event_id}: Only {len(odds_numbers)} odds found (need 26)")
+                # Try to extract more aggressively
+                odds_numbers = self._extract_odds_aggressive(lines)
+                if len(odds_numbers) < 26:
+                    print(f"❌ Match {event_id}: Still only {len(odds_numbers)} odds after aggressive extraction")
+                    return None
+
+            # Map odds to scores
+            correct_score_odds = self._map_odds_to_scores(odds_numbers)
+
+            # Display results
+            print(f"\n🎯 Event ID: {event_id}")
+            if home_team and away_team:
+                print(f"🏆 {home_team} vs {away_team}")
+            else:
+                print("🏆 Teams: Not identified")
+
+            print("\nFirst Half Correct Score Odds:")
+            print("-" * 50)
+
+            # Show first few scores to verify
+            for score in self.home_win_scores[:3]:  # Show first 3 only
+                home_key = f"{score}_home"
+                away_key = f"{score}_away"
+                home_odds = correct_score_odds.get(home_key, "—")
+                away_odds = correct_score_odds.get(away_key, "—")
+                print(f"{score}: 主={home_odds:<6} 客={away_odds}")
+
+            print("...")  # Indicate more scores
+
+            # Save individual match results
+            await self._save_match_results(
+                event_id, home_team, away_team,
+                odds_numbers, correct_score_odds, lines
+            )
+
+            return {
+                "event_id": event_id,
+                "home_team": home_team,
+                "away_team": away_team,
+                "scrape_time": datetime.now().isoformat(),
+                "odds_numbers": odds_numbers,
+                "correct_score_odds": correct_score_odds
+            }
+
+        except Exception as e:
+            print(f"❌ Error processing match: {e}")
+            return None
+
+    def _extract_teams(self, lines: List[str]) -> tuple:
+        """Extract home and away team names"""
+        home_team, away_team = "Unknown", "Unknown"
+
+        for i, line in enumerate(lines):
+            if line == '|' and i > 0 and i + 1 < len(lines):
+                home_team = lines[i - 1]
+                away_team = lines[i + 1]
+                break
+            elif i > 0 and "|" in line:
+                parts = line.split("|")
+                if len(parts) == 2:
+                    home_team = parts[0].strip()
+                    away_team = parts[1].strip()
+                    break
+
+        return home_team, away_team
+
+    def _extract_odds_numbers(self, lines: List[str]) -> List[float]:
+        """Extract all odds numbers from text lines"""
+        odds_numbers = []
+
+        for line in lines:
+            # Clean the line
+            clean_line = line.replace(',', '').strip()
+
+            # Check if it's a number (including decimals)
+            if self._is_odds_number(clean_line):
+                try:
+                    num = float(clean_line)
+                    if 0.5 <= num <= 1000.0:  # Wider valid odds range for headless
+                        odds_numbers.append(num)
+                except ValueError:
+                    continue
+
+        return odds_numbers
+
+    def _extract_odds_aggressive(self, lines: List[str]) -> List[float]:
+        """More aggressive odds extraction for headless mode"""
+        odds_numbers = []
+        all_text = ' '.join(lines)
+
+        # Find all number patterns
+        import re
+        number_patterns = [
+            r'\b\d+\.\d+\b',  # Decimal numbers
+            r'\b\d+\b',  # Whole numbers
+        ]
+
+        for pattern in number_patterns:
+            matches = re.findall(pattern, all_text)
+            for match in matches:
+                try:
+                    num = float(match)
+                    if 0.5 <= num <= 1000.0:
+                        odds_numbers.append(num)
+                except:
+                    continue
+
+        return odds_numbers
+
+    def _is_odds_number(self, text: str) -> bool:
+        """Check if text is a valid odds number"""
+        if not text:
+            return False
+
+        # Remove decimal point once and check if rest are digits
+        if text.replace('.', '', 1).isdigit():
+            return True
+
+        # Also accept numbers with decimal at start or end
+        if text.startswith('.') and text[1:].isdigit():
+            return True
+
+        return False
+
+    def _map_odds_to_scores(self, odds_numbers: List[float]) -> Dict[str, float]:
+        """Map 26 odds numbers to correct score positions"""
+        correct_score_odds = {}
+
+        # First 20 odds: 10 pairs of (Home, Away) for home win scores
+        for i in range(10):
+            if i * 2 < len(odds_numbers):
+                score = self.home_win_scores[i]
+                correct_score_odds[f"{score}_home"] = odds_numbers[i * 2]
+
+            if i * 2 + 1 < len(odds_numbers):
+                score = self.home_win_scores[i]
+                correct_score_odds[f"{score}_away"] = odds_numbers[i * 2 + 1]
+
+        # Next 6 odds: Home only for draw scores
+        draw_start_idx = 20
+        for i in range(6):
+            if draw_start_idx + i < len(odds_numbers):
+                score = self.draw_scores[i]
+                correct_score_odds[f"{score}_home"] = odds_numbers[draw_start_idx + i]
+
+        return correct_score_odds
+
+    async def _save_match_results(self, event_id: str, home_team: str, away_team: str,
+                                  odds_numbers: List[float], correct_score_odds: Dict[str, float],
+                                  lines: List[str]):
+        """Save individual match results"""
+        # Save JSON
+        result = {
+            "event_id": event_id,
+            "home_team": home_team,
+            "away_team": away_team,
+            "scrape_time": datetime.now().isoformat(),
+            "market": "上半場波膽 (First Half Correct Score)",
+            "odds_pattern": "10 pairs of (主, 客) odds + 6 主-only odds = 26 total",
+            "all_odds_numbers": odds_numbers,
+            "correct_score_odds": correct_score_odds,
+            "raw_lines_count": len(lines),
+            "note": "First 20 numbers: 10 pairs of (Home, Away) odds for 1:0 to 4:3. "
+                    "Next 6 numbers: Home odds only for 0:0, 1:1, 2:2, 3:3, 4:4, 其他."
+        }
+
+        json_file = self.output_dir / f"first_half_cs_{event_id}.json"
+        json_file.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+
+        # Save CSV
+        csv_file = self.output_dir / f"first_half_cs_{event_id}.csv"
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Score", "Home Odds", "Away Odds"])
+
+            # Home win scores
+            for score in self.home_win_scores:
+                home_key = f"{score}_home"
+                away_key = f"{score}_away"
+                home_odds = correct_score_odds.get(home_key, "")
+                away_odds = correct_score_odds.get(away_key, "")
+                writer.writerow([score, home_odds, away_odds])
+
+            # Draw scores
+            for score in self.draw_scores:
+                home_key = f"{score}_home"
+                home_odds = correct_score_odds.get(home_key, "")
+                writer.writerow([score, home_odds, ""])
+
+        print(f"\n💾 Saved: {json_file.name}")
+        print(f"📄 Saved: {csv_file.name}")
+
+    async def _save_combined_results(self, all_results: List[Dict]):
+        """Save all matches combined into one file"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Combined JSON
+        combined_json = {
+            "scrape_time": datetime.now().isoformat(),
+            "market": "上半場波膽 (First Half Correct Score)",
+            "total_matches": len(all_results),
+            "matches": all_results
+        }
+
+        json_file = self.output_dir / f"combined_first_half_cs_{timestamp}.json"
+        json_file.write_text(
+            json.dumps(combined_json, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+
+        # Combined CSV
+        csv_file = self.output_dir / f"combined_first_half_cs_{timestamp}.csv"
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Event ID", "Home Team", "Away Team", "Score",
+                             "Home Odds", "Away Odds"])
+
+            for match in all_results:
+                event_id = match["event_id"]
+                home_team = match["home_team"]
+                away_team = match["away_team"]
+                odds = match["correct_score_odds"]
+
+                # Home win scores
+                for score in self.home_win_scores:
+                    home_key = f"{score}_home"
+                    away_key = f"{score}_away"
+                    home_odds = odds.get(home_key, "")
+                    away_odds = odds.get(away_key, "")
+                    writer.writerow([event_id, home_team, away_team,
+                                     score, home_odds, away_odds])
+
+                # Draw scores
+                for score in self.draw_scores:
+                    home_key = f"{score}_home"
+                    home_odds = odds.get(home_key, "")
+                    writer.writerow([event_id, home_team, away_team,
+                                     score, home_odds, ""])
+
+        print(f"\n📦 Combined results saved:")
+        print(f"   JSON: {json_file.name}")
+        print(f"   CSV: {csv_file.name}")
+
+
+async def test_headless():
+    """Test headless mode separately"""
+    print("🧪 Testing headless mode...")
+
+    # First test with a simple page to see if browser works
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        # Test with a simple site first
+        await page.goto("http://httpbin.org/user-agent")
+        content = await page.text_content("body")
+        print("✓ Headless browser works")
+        print(f"User agent test: {content[:100]}...")
+
+        await browser.close()
+
+
+async def main():
+    """Main function"""
+    print("=" * 60)
+    print("FIRST HALF CORRECT SCORE (上半場波膽) SCRAPER")
+    print("=" * 60)
+    print("Pattern: 10 pairs of (Home, Away) odds + 6 Home-only odds")
+    print("Total: 26 odds numbers per match")
+    print()
+
+    # Ask for headless mode
+    headless_input = input("Run in headless mode? (y/n, default=n): ").strip().lower()
+    headless = headless_input == 'y'
+
+    if headless:
+        print("🔒 Running in stealth headless mode")
+        print("💡 If this fails, try running with visible browser first")
+
+        # Optional: Test headless mode first
+        test_choice = input("Test headless browser first? (y/n, default=n): ").strip().lower()
+        if test_choice == 'y':
+            await test_headless()
+    else:
+        print("👀 Running with browser visible")
+
+    scraper = FirstHalfCorrectScoreScraper(headless=headless)
+    await scraper.scrape()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
