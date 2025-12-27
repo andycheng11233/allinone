@@ -246,7 +246,8 @@ def parse_ai_json_response(text: str) -> Tuple[Optional[Dict[str, Any]], Optiona
         s = text.strip()
         if s.startswith("{") and s.endswith("}"):
             return json.loads(s), s
-        m = re.search(r'(\{(?:.|\s)*\})', text)
+        # Use non-backtracking pattern to avoid ReDoS
+        m = re.search(r'(\{[^{}]*\})', text, re.DOTALL)
         if m:
             candidate = m.group(1)
             return json.loads(candidate), candidate
