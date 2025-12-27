@@ -2,10 +2,16 @@
 """
 Unified MacauSlot + Titan007 + HKJC matcher + AI analysis.
 
-v21b updates:
-- Added fast-skip for HKJC Step 0: if declared match count is <= cached odds count (existing cache + processed set),
-  we skip the per-row clicking entirely to save time.
-- Existing behavior retained (stringified cache IDs, cached AI reuse, etc.).
+Updates in this version:
+- Robust Titan stats scraper (section-based).
+- Relaxed second-pass matcher (strict time, looser names) to raise coverage.
+- Alias system with source-tagged variants (auto-extended):
+    - alias.json: authoritative, auto-grown with seen names (teams/leagues) + per-source variants.
+    - unalias_pending.json: off-grid names (unmatched/very low sim) for manual review.
+    - Canonical preference: HKJC > MacauSlot > Titan. If HKJC appears later, canonical is promoted.
+- Avoids AI when Titan stats are missing or not meaningful.
+- HKJC Step 0 fast-skip if declared matches <= cached odds.
+
 """
 
 import asyncio
@@ -16,7 +22,7 @@ import json
 import logging
 import contextlib
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -70,24 +76,180 @@ HKJC_ODDS_PROCESSED_PATH = Path(".cache/hkjc_odds_processed.json")
 TITAN_STATS_PROCESSED_PATH = Path(".cache/titan_stats_processed.json")
 
 TITAN_STATS_BASE = Path("titan/stats")
+GAME_FILE = "game.json"  # for Titan league filter
 
-ALIAS_TABLE: Dict[str, set] = {
-    # "barcelona": {"barca", "fc barcelona", "巴塞", "巴塞隆拿"},
-}
+BAD_STRING = "暫無數據"
+MIN_SECTIONS_FOR_FULL = 3  # Titan stats: minimum sections to mark as "full"
+
+ALIAS_JSON_PATH = Path("alias.json")
+UNALIAS_PENDING_PATH = Path("unalias_pending.json")
+
+# In-memory alias structures (rebuilt from alias.json)
+alias_data: Dict[str, Dict[str, Dict[str, Any]]] = {"teams": {}, "leagues": {}}
+alias_modified = False
+ALIAS_TABLE: Dict[str, set] = {}          # team alias lookup
+LEAGUE_ALIAS_TABLE: Dict[str, set] = {}   # league alias lookup
+
+ALIAS_SOURCE_PRIORITY = ["hkjc", "macauslot", "titan"]
+
+def cprint(text: str, color: str = '', style: str = ''):
+    if COLORS_AVAILABLE:
+        print(f"{style}{color}{text}{Style.RESET_ALL}")
+    else:
+        print(text)
+
+def load_alias_table_from_json() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    if not ALIAS_JSON_PATH.exists():
+        return {"teams": {}, "leagues": {}}
+    try:
+        data = json.loads(ALIAS_JSON_PATH.read_text(encoding="utf-8"))
+        # Normalize structure
+        for cat in ("teams", "leagues"):
+            for canon, entry in list(data.get(cat, {}).items()):
+                entry.setdefault("variants", [])
+                entry.setdefault("sources", {})
+        return {"teams": data.get("teams", {}), "leagues": data.get("leagues", {})}
+    except Exception as e:
+        logger.warning("Failed to load alias.json: %s", e)
+        return {"teams": {}, "leagues": {}}
+
+def save_alias_table_if_needed():
+    global alias_modified
+    if not alias_modified:
+        return
+    try:
+        ALIAS_JSON_PATH.write_text(json.dumps(alias_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        alias_modified = False
+    except Exception as e:
+        logger.warning("Failed to save alias.json: %s", e)
+
+def rebuild_alias_lookup():
+    global ALIAS_TABLE, LEAGUE_ALIAS_TABLE
+    ALIAS_TABLE = {}
+    LEAGUE_ALIAS_TABLE = {}
+    for canon, entry in alias_data.get("teams", {}).items():
+        variants = set()
+        for v in entry.get("variants", []):
+            if v:
+                variants.add(v.strip().lower())
+        variants.add(canon.strip().lower())
+        ALIAS_TABLE[canon.strip().lower()] = variants
+    for canon, entry in alias_data.get("leagues", {}).items():
+        variants = set()
+        for v in entry.get("variants", []):
+            if v:
+                variants.add(v.strip().lower())
+        variants.add(canon.strip().lower())
+        LEAGUE_ALIAS_TABLE[canon.strip().lower()] = variants
 
 def resolve_alias(name: str) -> str:
     key = name.strip().lower()
     for canon, variants in ALIAS_TABLE.items():
-        if key == canon:
-            return canon
-        if key in variants:
+        if key == canon or key in variants:
             return canon
     return key
+
+def resolve_league_alias(name: str) -> str:
+    key = name.strip().lower()
+    for canon, variants in LEAGUE_ALIAS_TABLE.items():
+        if key == canon or key in variants:
+            return canon
+    return key
+
+def upsert_alias(kind: str, raw_name: str, source: str):
+    """
+    kind: "teams" or "leagues"
+    source: "hkjc" | "macauslot" | "titan"
+    Canonical preference: hkjc > macauslot > titan. If HKJC shows up later, canonical is promoted.
+    """
+    global alias_modified
+
+    if not raw_name:
+        return
+    if kind not in ("teams", "leagues"):
+        return
+
+    if kind == "teams":
+        base_norm = normalize_team_name(raw_name, apply_alias=False)
+    else:
+        base_norm = normalize_league(raw_name, apply_alias=False)
+
+    if not base_norm:
+        return
+
+    data = alias_data.setdefault(kind, {})
+    raw_lower = raw_name.strip().lower()
+
+    # Find existing canonical containing raw_name
+    found_canon = None
+    for canon, entry in data.items():
+        variants = [v.strip().lower() for v in entry.get("variants", [])]
+        if raw_lower == canon or raw_lower in variants:
+            found_canon = canon
+            break
+    if not found_canon and base_norm in data:
+        found_canon = base_norm
+
+    # Create or promote canonical
+    if not found_canon:
+        canon = base_norm
+        data.setdefault(canon, {"variants": [], "sources": {}})
+        entry = data[canon]
+    else:
+        canon = found_canon
+        entry = data[canon]
+        # Promote to HKJC if higher priority and new base_norm not present
+        if source == "hkjc" and canon != base_norm and base_norm not in data:
+            data[base_norm] = entry
+            del data[canon]
+            canon = base_norm
+            entry = data[canon]
+
+    # Add variants
+    variants = entry.get("variants", [])
+    def add_var(val: str):
+        if val and val not in variants:
+            variants.append(val)
+    add_var(raw_name)
+    add_var(base_norm)
+    entry["variants"] = variants
+
+    # Add source variants
+    srcs = entry.get("sources", {})
+    lst = srcs.get(source, [])
+    if raw_name not in lst:
+        lst.append(raw_name)
+    if base_norm not in lst:
+        lst.append(base_norm)
+    srcs[source] = lst
+    entry["sources"] = srcs
+    data[canon] = entry
+    alias_data[kind] = data
+    alias_modified = True
+    rebuild_alias_lookup()
+
+def append_unalias_pending(kind: str, seen: str, source: str = "", context: str = "", suggested_canon: str = ""):
+    if not seen:
+        return
+    UNALIAS_PENDING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        pending = json.loads(UNALIAS_PENDING_PATH.read_text(encoding="utf-8")) if UNALIAS_PENDING_PATH.exists() else {"teams": [], "leagues": []}
+    except Exception:
+        pending = {"teams": [], "leagues": []}
+    bucket = pending.get(kind, [])
+    if not any((entry.get("seen") == seen and entry.get("source") == source) for entry in bucket):
+        bucket.append({"seen": seen, "source": source, "context": context, "suggested_canon": suggested_canon})
+    pending[kind] = bucket
+    UNALIAS_PENDING_PATH.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# Load aliases at start
+alias_data = load_alias_table_from_json()
+rebuild_alias_lookup()
 
 def strip_accents(text: str) -> str:
     return ''.join(ch for ch in unicodedata.normalize('NFKD', text) if not unicodedata.combining(ch))
 
-def normalize_team_name(name: str) -> str:
+def normalize_team_name(name: str, apply_alias: bool = True) -> str:
     if not name:
         return ""
     name = strip_accents(name)
@@ -98,15 +260,19 @@ def normalize_team_name(name: str) -> str:
     name = re.sub(r'\b(fc|cf|sc|afc|cfc)\b', '', name)
     name = re.sub(r'[^a-z0-9\u4e00-\u9fff]+', ' ', name)
     name = re.sub(r'\s+', ' ', name).strip()
-    name = resolve_alias(name)
+    if apply_alias:
+        name = resolve_alias(name)
     return name
 
-def normalize_league(text: str) -> str:
+def normalize_league(text: str, apply_alias: bool = True) -> str:
     if not text:
         return ""
     t = strip_accents(text).lower()
     t = re.sub(r'[^a-z0-9\u4e00-\u9fff]+', ' ', t)
-    return re.sub(r'\s+', ' ', t).strip()
+    t = re.sub(r'\s+', ' ', t).strip()
+    if apply_alias:
+        t = resolve_league_alias(t)
+    return t
 
 def league_bonus(l1: str, l2: str, bonus: float = 0.05) -> float:
     if not l1 or not l2:
@@ -119,6 +285,18 @@ def name_similarity(a: str, b: str) -> float:
     if not na or not nb:
         return 0.0
     return SequenceMatcher(None, na, nb).ratio()
+
+def token_overlap_score(a: str, b: str) -> float:
+    ta = set(normalize_team_name(a).split())
+    tb = set(normalize_team_name(b).split())
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    return inter / max(len(ta), len(tb))
+
+def _norm(val: Any) -> str:
+    s = str(val).strip() if val is not None else ""
+    return "" if s.lower() in {"", "null", "none", "undefined"} else s
 
 def load_ai_cache() -> Dict[str, Any]:
     try:
@@ -166,12 +344,6 @@ def load_hkjc_odds_from_disk(odds_dir: Path = Path("hkjc/odds")) -> Dict[str, Di
         except Exception:
             continue
     return cache
-
-def cprint(text: str, color: str = '', style: str = ''):
-    if COLORS_AVAILABLE:
-        print(f"{style}{color}{text}{Style.RESET_ALL}")
-    else:
-        print(text)
 
 def find_best_float_in_text(text: str, min_val: float = -1e9, max_val: float = 1e9) -> Optional[float]:
     if not text:
@@ -990,14 +1162,13 @@ class HKJCHomeScraper:
             declared = await self.get_declared(page)
             logger.info("Declared: %s matches", declared or "unknown")
 
-            # Fast-skip: if we already have enough cached odds, skip per-row clicking
             if fast_skip_if_cache_sufficient and declared and cached_count >= declared:
                 logger.info(
                     "Fast-skip HKJC row scan: declared=%d, cached_odds=%d (>=), skipping row clicks.",
                     declared, cached_count
                 )
                 await browser.close()
-                return results  # empty list -> collector will see zero new IDs
+                return results
 
             await self.scroll_bottom(page)
             await self.click_show_more(page)
@@ -1118,7 +1289,6 @@ class HKJCBulkOddsCollector:
 
     async def collect(self, max_events: Optional[int] = None, concurrency: int = 4, force_rescrape: bool = False,
                       fast_skip_if_cache_sufficient: bool = True) -> Tuple[Dict[str, Dict[str, Any]], set, List[Dict[str, Any]]]:
-        # cached_count = odds already present (existing_cache or processed)
         cached_count = len(set(self.existing_cache.keys()) | set(self.skip_ids))
 
         home_rows = await self.home_scraper.scrape(
@@ -1196,220 +1366,144 @@ class HKJCBulkOddsCollector:
         logger.info("💾 Saved HKJC all odds to: %s (events=%d)", out_path, len(results))
         return results, self.skip_ids, home_rows
 
-async def scrape_match_stats_from_analysis_page(titan_match_id: str) -> Dict[str, Any]:
-    url = f"https://zq.titan007.com/analysis/{titan_match_id}.htm"
-    logger.info("🔍 Scraping analysis stats for Titan match ID: %s", titan_match_id)
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            await page.goto(url, wait_until='networkidle', timeout=60000)
-            await asyncio.sleep(3.0)
-            try:
-                await page.wait_for_selector("table", timeout=3000)
-            except Exception:
-                pass
-            content = await page.content()
-            if DEBUG_INSTRUMENTATION_AVAILABLE:
-                try:
-                    save_rendered_html("titan_analysis", titan_match_id, content)
-                except Exception:
-                    pass
-            soup = BeautifulSoup(content, "html.parser")
-            data = {
-                "match_id": titan_match_id,
-                "scraped_at": datetime.now().isoformat(),
-                "url": url,
-                "sections": {},
-                "stats_available": False
-            }
+# ---------- Titan stats scraper (updated) ----------
 
-            page_text = soup.get_text(separator=' ', strip=True)
-            no_data_patterns = ["暫無數據", "數據統計中", "未開始", "資料準備中", "尚無相關資料", "No data"]
-            for pat in no_data_patterns:
-                if pat in page_text:
-                    logger.warning("⚠️ Titan %s: '%s' found — no stats available", titan_match_id, pat)
-                    data["error"] = f"No stats: {pat}"
-                    if DEBUG_INSTRUMENTATION_AVAILABLE:
-                        try:
-                            save_parsed_json("titan_analysis_parsed", titan_match_id, data)
-                        except Exception:
-                            pass
-                    return data
-
-            def extract_section_by_regex(regex: str) -> Optional[Any]:
-                header = soup.find(string=re.compile(regex))
-                if not header:
-                    return None
-                parent = None
-                try:
-                    if isinstance(header, Tag):
-                        parent = header.find_parent()
-                    else:
-                        parent = header.parent if hasattr(header, "parent") else None
-                except Exception:
-                    parent = header.parent if hasattr(header, "parent") else None
-                if not parent:
-                    parent = header.parent if hasattr(header, "parent") else None
-                if not parent:
-                    return None
-                tables = parent.find_all('table')
-                for table in tables:
-                    parsed = extract_table_data(table)
-                    if parsed:
-                        return parsed
-                txt = parent.get_text(separator=' | ', strip=True)
-                if txt and len(txt) > 30:
-                    return [{"text_content": txt}]
-                return None
-
-            sections_to_try = [
-                ("league_standings", r'聯賽積分排名'),
-                ("head_to_head", r'對賽往績'),
-                ("data_comparison", r'數據對比'),
-                ("referee_stats", r'裁判統計'),
-                ("league_trend", r'聯賽盤路走勢'),
-                ("same_trend", r'相同盤路'),
-                ("goal_distribution", r'入球數/上下半場入球分布'),
-                ("halftime_fulltime", r'半全場'),
-                ("goal_count", r'進球數/單雙'),
-                ("goal_time", r'進球時間'),
-                ("future_matches", r'未來五場'),
-                ("pre_match_brief", r'賽前簡報'),
-                ("season_stats_comparison", r'本賽季數據統計比較'),
-            ]
-
-            sections_found = 0
-            for key, regex in sections_to_try:
-                try:
-                    sec = extract_section_by_regex(regex)
-                    if sec:
-                        data["sections"][key] = sec
-                        sections_found += 1
-                        logger.debug("✅ Extracted section %s for match %s", key, titan_match_id)
-                except Exception:
-                    logger.debug("Failed extracting section %s", key)
-
-            formation_header = soup.find(string=re.compile(r'陣容情況'))
-            if formation_header:
-                parent = formation_header.find_parent() if hasattr(formation_header, "find_parent") else formation_header.parent
-                if parent:
-                    data["sections"]["team_formation"] = parent.get_text(separator=' | ', strip=True)
-                    sections_found += 1
-
-            try:
-                home_avg, home_list = extract_ratings_or_average_from_text(page_text)
-                away_avg, away_list = None, []
-                m_home = re.search(r'主隊近10場平均評分[:：]?\s*([0-9\.\s]{5,200})', page_text)
-                m_away = re.search(r'客隊近10場平均評分[:：]?\s*([0-9\.\s]{5,200})', page_text)
-                if m_home:
-                    home_avg, home_list = extract_ratings_or_average_from_text("主隊近10場平均評分:" + m_home.group(1))
-                if m_away:
-                    away_avg, away_list = extract_ratings_or_average_from_text("客隊近10場平均評分:" + m_away.group(1))
-                if away_avg is None:
-                    away_avg, away_list = extract_ratings_or_average_from_text(page_text)
-                if home_avg is not None:
-                    data["home_rating"] = home_avg
-                    data["home_recent_ratings"] = home_list
-                if away_avg is not None:
-                    data["away_rating"] = away_avg
-                    data["away_recent_ratings"] = away_list
-            except Exception as e:
-                logger.debug("Rating extraction exception: %s", e)
-
-            if sections_found >= 1 or data.get("home_rating") or data.get("away_rating"):
-                data["stats_available"] = True
-                logger.info("✅ Titan %s: scraped %d sections", titan_match_id, sections_found)
-            else:
-                data["error"] = f"Insufficient stats ({sections_found} sections)"
-                logger.warning("⚠️ Titan %s: insufficient stats (%d sections)", titan_match_id, sections_found)
-
-            if DEBUG_INSTRUMENTATION_AVAILABLE:
-                try:
-                    save_parsed_json("titan_analysis_parsed", titan_match_id, data)
-                except Exception:
-                    pass
-            return data
-        except Exception as e:
-            logger.exception("Error scraping analysis stats for Titan match %s: %s", titan_match_id, e)
-            return {
-                "match_id": titan_match_id,
-                "scraped_at": datetime.now().isoformat(),
-                "url": url,
-                "stats_available": False,
-                "error": str(e)
-            }
-        finally:
-            try:
-                await browser.close()
-            except Exception:
-                logger.debug("Browser close failed (ignored) for %s", titan_match_id)
-
-def extract_table_data_from_real_table(table_elem: Tag) -> List[Dict[str, str]]:
-    rows = table_elem.find_all('tr')
-    if not rows:
-        return []
-    header_row = None
+def _is_real_data_table(tbl: Tag) -> bool:
+    rows = tbl.find_all("tr")
+    if len(rows) < 2:
+        return False
     for row in rows:
-        cells = row.find_all(['th', 'td'])
-        if cells and 2 <= len(cells) <= 30:
-            cell_texts = [c.get_text(strip=True) for c in cells]
-            header_words = ['賽', '勝', '平', '負', '得', '失', '積分', '勝率', '排名', '主場', '客場']
-            if any(any(w in txt for w in header_words) for txt in cell_texts):
-                header_row = row
-                break
-    if not header_row:
-        header_row = rows[0]
-    headers = []
-    for cell in header_row.find_all(['th', 'td']):
-        text = cell.get_text(strip=True)
-        clean_text = re.sub(r'\s+', ' ', text).strip() if text else f"col_{len(headers)}"
-        headers.append(clean_text)
-    if len(headers) < 2 or len(headers) > 30:
-        return []
-    data = []
-    start_index = rows.index(header_row) + 1 if header_row in rows else 1
-    for row in rows[start_index:]:
-        cells = row.find_all(['td', 'th'])
-        if not cells or len(cells) < 2:
-            continue
-        row_data = {}
-        for i, cell in enumerate(cells):
-            if i >= len(headers):
-                break
-            cell_text = cell.get_text(strip=True)
-            clean_text = re.sub(r'\s+', ' ', cell_text).strip()
-            if clean_text:
-                row_data[headers[i]] = clean_text
-                link = cell.find('a')
-                if link and link.get('href'):
-                    row_data[f"{headers[i]}_link"] = link.get('href')
-        if row_data and len(row_data) >= 2:
-            data.append(row_data)
-    return data
+        cells = [c.get_text(strip=True) for c in row.find_all(['td', 'th'])]
+        for cell in cells:
+            if cell and BAD_STRING not in cell:
+                return True
+    return False
 
-def extract_table_data(table_elem: Tag) -> List[Dict[str, str]]:
-    rows = table_elem.find_all('tr')
-    if not rows:
-        return []
-    first_row_cells = rows[0].find_all(['th', 'td'])
-    if len(first_row_cells) > 50:
-        nested_tables = table_elem.find_all('table', class_=re.compile(r'oddsTable|dataTable|statsTable', re.I))
-        if nested_tables:
-            return extract_table_data_from_real_table(nested_tables[0])
-        for nested in table_elem.find_all('table'):
-            nested_rows = nested.find_all('tr')
-            if nested_rows:
-                first_nested_cells = nested_rows[0].find_all(['th', 'td'])
-                if 3 <= len(first_nested_cells) <= 20:
-                    return extract_table_data_from_real_table(nested)
-        return []
-    return extract_table_data_from_real_table(table_elem)
+def _extract_table_text(tbl: Tag) -> List[List[str]]:
+    return [
+        [cell.get_text(strip=True) for cell in row.find_all(['th', 'td'])]
+        for row in tbl.find_all("tr")
+    ]
+
+def _analyze_sections(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    found, missing = [], []
+    debug_info = {}
+    tables: Dict[str, List[List[str]]] = {}
+    sections_to_try = [
+        ("league_standings",           r"聯賽積分排名"),
+        ("head_to_head",               r"對賽往績"),
+        ("data_comparison",            r"數據對比"),
+        ("referee_stats",              r"裁判統計"),
+        ("league_trend",               r"聯賽盤路走勢"),
+        ("same_trend",                 r"相同盤路"),
+        ("goal_distribution",          r"入球數/上下半場入球分布"),
+        ("halftime_fulltime",          r"半全場"),
+        ("goal_count",                 r"進球數/單雙"),
+        ("goal_time",                  r"進球時間"),
+        ("future_matches",             r"未來五場"),
+        ("pre_match_brief",            r"賽前簡報"),
+        ("season_stats_comparison",    r"本賽季數據統計比較"),
+        ("recent_form",                r"近期戰績"),
+        ("last_match_player_ratings",  r"球員上一場出場評分"),
+        ("lineup_and_injuries",        r"陣容情況"),
+        ("pre_match_table",            r"賽前積分榜"),
+    ]
+
+    for key, regex in sections_to_try:
+        header = soup.find(string=re.compile(regex))
+        section_status = "not_found"
+        if header:
+            tbl = header.find_next("table")
+            if tbl and _is_real_data_table(tbl):
+                section_status = "real_data"
+                found.append(key)
+                tables[key] = _extract_table_text(tbl)
+            elif tbl:
+                section_status = "only_bad_string"
+                missing.append(key)
+            else:
+                section_status = "table_not_found"
+                missing.append(key)
+        else:
+            missing.append(key)
+        debug_info[key] = section_status
+    return found, missing, debug_info, tables
+
+class TitanStatsScraper:
+    def __init__(self, base_dir: Path = TITAN_STATS_BASE):
+        self.base_dir = base_dir
+        self.full_dir = base_dir / "full"
+        self.missing_dir = base_dir / "missing"
+        self.full_dir.mkdir(parents=True, exist_ok=True)
+        self.missing_dir.mkdir(parents=True, exist_ok=True)
+
+    async def scrape_one(self, match_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        url = f"https://zq.titan007.com/analysis/{match_id}.htm"
+        out: Dict[str, Any] = {
+            "match_id": match_id,
+            "url": url,
+            "scraped_at": datetime.now().isoformat(),
+            "sections_found": [],
+            "sections_missing": [],
+            "sections_debug": {},
+            "sections_data": {},
+            "has_stats": False,
+            "home_team": "",
+            "away_team": "",
+            "game_time": "",
+            "league": "",
+        }
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=60000)
+                await asyncio.sleep(2.5)
+                html = await page.content()
+            except Exception as e:
+                out["error"] = str(e)
+                await browser.close()
+                return out, "error"
+            await browser.close()
+
+        found, missing, debug, tables = _analyze_sections(html)
+        out["sections_found"] = found
+        out["sections_missing"] = missing
+        out["sections_debug"] = debug
+        out["sections_data"] = tables
+        out["has_stats"] = len(found) >= MIN_SECTIONS_FOR_FULL
+
+        soup = BeautifulSoup(html, "html.parser")
+        title_text = ""
+        if soup.title:
+            try:
+                title_text = soup.title.get_text(strip=True)
+            except Exception:
+                title_text = ""
+        if title_text:
+            m = re.search(r"(.+?) vs (.+?)[\s|【]", title_text)
+            if m:
+                out["home_team"] = m.group(1).strip()
+                out["away_team"] = m.group(2).strip()
+
+        status = "full" if out["has_stats"] else "missing"
+        target_dir = self.full_dir if status == "full" else self.missing_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        (target_dir / f"{match_id}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out, status
+
+# ---------- Macau Slot scraper (unchanged from earlier update) ----------
 
 class MacauSlotOddsScraper:
+    """
+    Updated Macau Slot odds scraper with deterministic pagination, date extraction,
+    cross-midnight handling, and conservative skip of already-started matches.
+    Saves JSON and Excel under macauslot/odd/.
+    """
     def __init__(self):
         self.base_url = "https://www.macau-slot.com/content/soccer/coming_bet.html"
-        self.output_dir = Path("macauslot/odds")
+        self.output_dir = Path("macauslot/odd")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def load_latest_from_disk(self) -> Optional[Dict[str, Any]]:
@@ -1425,6 +1519,81 @@ class MacauSlotOddsScraper:
             except Exception:
                 continue
         return None
+
+    async def _extract_page_date(self, page) -> Optional[str]:
+        try:
+            locator = page.locator(r"text=/\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日/").first
+            if await locator.count() > 0:
+                txt = await locator.inner_text()
+            else:
+                txt = await page.evaluate("() => document.body.innerText") or ""
+            m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", txt)
+            if m:
+                y, mo, d = m.groups()
+                return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+        except Exception:
+            return None
+        return None
+
+    def _should_skip_started(self, match_time: str, match_date: Optional[str]) -> bool:
+        if not match_time or match_time == "Unknown":
+            return False
+        try:
+            hh, mm = map(int, match_time.split(":"))
+        except Exception:
+            return False
+
+        now = datetime.now()
+        if match_date:
+            try:
+                dt_date = datetime.strptime(match_date, "%Y-%m-%d").date()
+            except Exception:
+                dt_date = None
+        else:
+            dt_date = None
+
+        if dt_date:
+            candidate = datetime.combine(dt_date, datetime.min.time()).replace(hour=hh, minute=mm)
+            if candidate.date() < now.date():
+                return True
+            if candidate.date() == now.date() and (now - candidate) > timedelta(minutes=5):
+                return True
+            return False
+        return False
+
+    def _adjust_dates_for_page(self, matches: List[Dict[str, Any]], page_date_iso: Optional[str]) -> List[Dict[str, Any]]:
+        times = [m.get("minutes") for m in matches]
+        initial_offset = 0
+        if page_date_iso and times:
+            first = times[0]
+            has_late = any(t is not None and t >= 720 for t in times)
+            if first is not None and first < 360 and has_late:
+                initial_offset = 1
+
+        offset = initial_offset
+        working_date = None
+        if page_date_iso:
+            try:
+                dt = datetime.strptime(page_date_iso, "%Y-%m-%d") + timedelta(days=offset)
+                working_date = dt.strftime("%Y-%m-%d")
+            except Exception:
+                working_date = page_date_iso
+
+        prev_minutes = None
+        for m in matches:
+            minutes = m.get("minutes")
+            if working_date and minutes is not None and prev_minutes is not None:
+                if minutes + 60 < prev_minutes:
+                    try:
+                        dt = datetime.strptime(working_date, "%Y-%m-%d") + timedelta(days=1)
+                        working_date = dt.strftime("%Y-%m-%d")
+                        offset += 1
+                    except Exception:
+                        pass
+            if minutes is not None:
+                prev_minutes = minutes
+            m["match_date"] = working_date or page_date_iso or ""
+        return matches
 
     async def _scrape_page_data_js(self, page) -> List[Dict]:
         try:
@@ -1551,13 +1720,63 @@ class MacauSlotOddsScraper:
             logger.error("⚠️ JS scrape failed: %s", e)
             return []
 
-    async def scrape_with_logging(self, max_pages: int = 20, skip_ids: Optional[set] = None) -> List[Dict]:
-        logger.info("🌐 Scraping Macau Slot live odds...")
-        skip_ids = skip_ids or set()
+    async def _click_page(self, page, page_num: int) -> bool:
+        try:
+            prev = await page.content()
+            inp = await page.query_selector(f"input[value='{page_num}']")
+            if not inp:
+                inputs = await page.query_selector_all("input")
+                for cand in inputs:
+                    for attr in ("data-page", "data-max", "max"):
+                        v = await cand.get_attribute(attr)
+                        if v and v.isdigit() and int(v) == page_num:
+                            inp = cand
+                            break
+                    if inp:
+                        break
+            if inp:
+                await inp.scroll_into_view_if_needed()
+                await inp.click(force=True)
+                await page.wait_for_timeout(400)
+                await page.wait_for_load_state("networkidle")
+                new = await page.content()
+                return new != prev
+            btn = await page.query_selector(f"a:has-text('{page_num}'), button:has-text('{page_num}')")
+            if btn:
+                await btn.scroll_into_view_if_needed()
+                await btn.click(force=True)
+                await page.wait_for_timeout(400)
+                await page.wait_for_load_state("networkidle")
+                new = await page.content()
+                return new != prev
+            return False
+        except Exception:
+            return False
+
+    async def _get_real_page_numbers(self, page, cap: int = 15) -> List[int]:
+        try:
+            max_candidate = 1
+            inputs = await page.query_selector_all("input")
+            for inp in inputs:
+                for attr in ("data-max", "max", "data-page", "value"):
+                    v = await inp.get_attribute(attr)
+                    if v and v.isdigit():
+                        num = int(v)
+                        if 1 <= num <= cap:
+                            max_candidate = max(max_candidate, num)
+            pages = list(range(1, max_candidate + 1))
+            return pages if pages else [1]
+        except Exception as e:
+            logger.warning(f"Error getting page numbers: {e}")
+            return [1]
+
+    async def scrape_with_logging(self, max_pages: int = 15) -> List[Dict]:
+        logger.info("🌐 Scraping Macau Slot live odds (deterministic pagination)...")
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
             page = await context.new_page()
+            all_matches = []
             try:
                 goto_retries = 3
                 for attempt in range(1, goto_retries + 1):
@@ -1571,23 +1790,46 @@ class MacauSlotOddsScraper:
                         await asyncio.sleep(1.5 * attempt)
 
                 await asyncio.sleep(3)
-                all_matches = []
-                for page_num in range(1, max_pages + 1):
+
+                page_numbers = await self._get_real_page_numbers(page, cap=max_pages)
+                logger.info("Macau detected pages: %s", page_numbers)
+
+                for page_num in page_numbers:
                     if page_num > 1:
-                        btn = await page.query_selector(f'input.msl-menu-page[value="{page_num}"]')
-                        if btn and await btn.is_visible():
-                            await btn.click()
-                            await asyncio.sleep(1.5)
-                        else:
+                        ok = await self._click_page(page, page_num)
+                        await asyncio.sleep(2)
+                        await page.wait_for_load_state("networkidle")
+                        if not ok:
+                            logger.warning("Failed to change to page %d, stopping pagination", page_num)
                             break
-                    page_data = await self._scrape_page_data_js(page)
-                    logger.info("Macau page %d: raw items=%d", page_num, len(page_data or []))
-                    if page_data:
-                        filtered = [m for m in page_data if m.get("event_id") not in skip_ids]
-                        all_matches.extend(filtered)
-                        logger.info("Macau page %d: kept %d (skipped %d)", page_num, len(filtered), len(page_data) - len(filtered))
-                    else:
-                        break
+
+                    page_date_iso = await self._extract_page_date(page)
+                    raw_page_matches = await self._scrape_page_data_js(page)
+                    logger.info("Macau page %d: raw items=%d (date=%s)", page_num, len(raw_page_matches or []), page_date_iso or "Unknown")
+
+                    prepared = []
+                    for m in raw_page_matches:
+                        t = m.get("time", "")
+                        minutes = None
+                        if t and re.match(r'^\d{1,2}:\d{2}$', t):
+                            try:
+                                hh, mm = map(int, t.split(":"))
+                                minutes = hh * 60 + mm
+                            except Exception:
+                                minutes = None
+                        m["minutes"] = minutes
+                        prepared.append(m)
+
+                    prepared = self._adjust_dates_for_page(prepared, page_date_iso)
+
+                    for m in prepared:
+                        match_time = m.get("time") or "Unknown"
+                        match_date = m.get("match_date") or ""
+                        if self._should_skip_started(match_time, match_date):
+                            logger.info("  ⏭ SKIP started: %s vs %s | %s %s", m.get("home_team"), m.get("away_team"), match_date or "Unknown", match_time)
+                            continue
+                        all_matches.append(m)
+
                 await browser.close()
                 return all_matches
             except Exception as e:
@@ -1613,7 +1855,34 @@ class MacauSlotOddsScraper:
         }
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
-        logger.info("💾 Saved Macau odds to: %s", filename)
+        logger.info("💾 Saved Macau odds JSON to: %s", filename)
+        return str(filename)
+
+    def save_to_excel(self, data: List[Dict], filename: Optional[str] = None) -> str:
+        if not filename:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = self.output_dir / f"macauslot_odds_{ts}.xlsx"
+        else:
+            filename = Path(filename)
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for m in data:
+            hda = m.get("odds", {}).get("home_draw_away", {}) if isinstance(m.get("odds"), dict) else {}
+            rows.append({
+                "event_id": m.get("event_id"),
+                "home": m.get("home_team"),
+                "away": m.get("away_team"),
+                "competition": m.get("competition"),
+                "time": m.get("time"),
+                "match_date": m.get("match_date"),
+                "home_odds": hda.get("home_odds"),
+                "draw_odds": hda.get("draw_odds"),
+                "away_odds": hda.get("away_odds"),
+            })
+        df = pd.DataFrame(rows)
+        with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="MacauSlot", index=False)
+        logger.info("💾 Saved Macau odds Excel to: %s", filename)
         return str(filename)
 
 class LiveMatchMatcher:
@@ -1648,6 +1917,7 @@ class LiveMatchMatcher:
         self.hkjc_odds_processed |= set(disk_odds.keys())
 
         self.titan_stats_processed: set = load_cache_set(TITAN_STATS_PROCESSED_PATH, as_str=True)
+        self.titan_scraper = TitanStatsScraper()
 
     def normalize_time(self, time_str: str) -> Optional[datetime]:
         if not time_str:
@@ -1932,8 +2202,6 @@ class LiveMatchMatcher:
                     content = await page.content()
                     if DEBUG_INSTRUMENTATION_AVAILABLE:
                         save_rendered_html("titan_index", "index", content)
-                    else:
-                        _ = content
                 except Exception:
                     pass
                 soup = BeautifulSoup(content, 'html.parser')
@@ -2038,10 +2306,11 @@ class LiveMatchMatcher:
     def load_titan_stats_from_disk(self, match_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
         base = TITAN_STATS_BASE
         full_path = base / "full" / f"{match_id}.json"
+        miss_path = base / "missing" / f"{match_id}.json"
         inc_path = base / "incomplete" / f"{match_id}.json"
-        miss_path = base / "completelymissing" / f"{match_id}.json"
+        miss2_path = base / "completelymissing" / f"{match_id}.json"
 
-        try_paths = [("full", full_path), ("incomplete", inc_path), ("missing", miss_path)]
+        try_paths = [("full", full_path), ("missing", miss_path), ("incomplete", inc_path), ("missing", miss2_path)]
         for status, p in try_paths:
             if p.exists():
                 try:
@@ -2051,6 +2320,71 @@ class LiveMatchMatcher:
                     logger.warning("Failed reading titan stats %s (%s): %s", match_id, status, e)
                     return None, "none"
         return None, "none"
+
+    def relaxed_second_pass(self,
+                            hkjc_pool: List[Dict],
+                            titan_pool: List[Dict],
+                            macau_map: Dict[str, Dict],
+                            time_grace_minutes: int = 2,
+                            name_floor_time_ok: float = 0.40,
+                            name_floor_no_time: float = 0.55,
+                            margin: float = 0.05):
+        """
+        Attempt matches with stricter time (same-minute-ish) and looser name.
+        Returns (new_matches, remaining_hkjc, remaining_titan).
+        """
+        remaining_hkjc = list(hkjc_pool)
+        remaining_titan = list(titan_pool)
+        new_matches = []
+
+        def exact_time_ok(t1: Optional[datetime], t2: Optional[datetime]) -> bool:
+            if not t1 or not t2:
+                return False
+            return abs((t1 - t2).total_seconds()) <= time_grace_minutes * 60
+
+        def best_candidate(h_item, t_items):
+            best = None
+            best_score = -1
+            second = -1
+            h_time = self.normalize_time(h_item.get("match_time_original") or h_item.get("normalized_time"))
+            h_league = h_item.get("tournament", "")
+            for t in t_items:
+                t_time = t.get("normalized_time")
+                time_match = exact_time_ok(h_time, t_time)
+                if not time_match and (h_time and t_time):
+                    continue
+                sim_home = name_similarity(h_item["home_team"], t["home_team"])
+                sim_away = name_similarity(h_item["away_team"], t["away_team"])
+                avg_sim = (sim_home + sim_away) / 2
+                tok = token_overlap_score(h_item["home_team"] + " " + h_item["away_team"],
+                                          t["home_team"] + " " + t["away_team"])
+                eff = avg_sim + league_bonus(h_league, t.get("league", ""), 0.05) + 0.05 * tok
+                floor = name_floor_time_ok if time_match else name_floor_no_time
+                if eff >= floor and eff > best_score:
+                    second = best_score
+                    best_score = eff
+                    best = t
+                elif eff > second:
+                    second = eff
+            if best is None:
+                return None, None
+            if second >= 0 and best_score < second + margin:
+                return None, None
+            return best, best_score
+
+        matched_titan_ids = set()
+        still_hkjc = []
+        for h in hkjc_pool:
+            t_candidate, score = best_candidate(h, [t for t in remaining_titan if t.get("match_id") not in matched_titan_ids])
+            if not t_candidate:
+                still_hkjc.append(h)
+                continue
+            matched_titan_ids.add(t_candidate["match_id"])
+            macau = macau_map.get(t_candidate["match_id"])
+            new_matches.append((h, t_candidate, macau, score))
+
+        still_titan = [t for t in remaining_titan if t.get("match_id") not in matched_titan_ids]
+        return new_matches, still_hkjc, still_titan
 
     async def find_matching_games(self) -> Tuple[List[Dict], List[Dict]]:
         cprint("\n" + "=" * 80, Fore.WHITE)
@@ -2067,7 +2401,7 @@ class LiveMatchMatcher:
             except Exception:
                 pass
 
-        # Step 0: HKJC bulk odds with fast-skip based on cache size vs declared
+        # Step 0: HKJC bulk odds
         cprint("\n📥 Step 0: Scraping HKJC All Odds (bulk, skip cached)...", Fore.BLUE)
         home_scraper = HKJCHomeScraper()
         hkjc_detailed_scraper = HKJCDetailedOddsScraper()
@@ -2091,10 +2425,11 @@ class LiveMatchMatcher:
             macau_odds = macau_disk["matches"]
             cprint(f"✅ Macau Slot (reused from disk): {len(macau_odds)} matches", Fore.GREEN)
         else:
-            macau_odds = await macau_scraper.scrape_with_logging(max_pages=20, skip_ids=None)
+            macau_odds = await macau_scraper.scrape_with_logging(max_pages=15)
             if macau_odds:
-                macau_file = macau_scraper.save_to_json(macau_odds)
-                cprint(f"✅ Macau Slot scraped: {len(macau_odds)} matches saved to {macau_file}", Fore.GREEN)
+                macau_json = macau_scraper.save_to_json(macau_odds)
+                macau_excel = macau_scraper.save_to_excel(macau_odds)
+                cprint(f"✅ Macau Slot scraped: {len(macau_odds)} matches saved to {macau_json} and {macau_excel}", Fore.GREEN)
             else:
                 cprint("⚠️ No Macau Slot odds scraped", Fore.YELLOW)
                 macau_odds = []
@@ -2115,6 +2450,21 @@ class LiveMatchMatcher:
         cprint(f"  Titan007: {len(titan_matches)} matches", Fore.CYAN)
         cprint(f"  Macau Slot: {len(macau_odds)} matches", Fore.CYAN)
 
+        # Ingest aliases (auto-extend alias.json)
+        for h in hkjc_matches:
+            upsert_alias("teams", h.get("home_team", ""), "hkjc")
+            upsert_alias("teams", h.get("away_team", ""), "hkjc")
+            upsert_alias("leagues", h.get("tournament", ""), "hkjc")
+        for t in titan_matches:
+            upsert_alias("teams", t.get("home_team", ""), "titan")
+            upsert_alias("teams", t.get("away_team", ""), "titan")
+            upsert_alias("leagues", t.get("league", ""), "titan")
+        for m in macau_odds:
+            upsert_alias("teams", m.get("home_team", ""), "macauslot")
+            upsert_alias("teams", m.get("away_team", ""), "macauslot")
+            upsert_alias("leagues", m.get("competition", ""), "macauslot")
+        save_alias_table_if_needed()
+
         future_hkjc_matches, started_hkjc_matches = self.filter_future_hkjc_matches(hkjc_matches)
         if started_hkjc_matches:
             cprint(f"⏭️ Skipping {len(started_hkjc_matches)} HKJC matches that already started.", Fore.YELLOW)
@@ -2131,7 +2481,7 @@ class LiveMatchMatcher:
             titan_time = titan.get("normalized_time")
             titan_league = titan.get("league")
             for macau in macau_odds:
-                macau_time = self.normalize_time(macau.get('time', ''))
+                macau_time = self.normalize_time(macau.get('match_date', '') + " " + macau.get('time', '')) if macau.get('match_date') else self.normalize_time(macau.get('time', ''))
                 sim_home = name_similarity(titan['home_team'], macau.get('home_team', ''))
                 sim_away = name_similarity(titan['away_team'], macau.get('away_team', ''))
                 avg_sim = (sim_home + sim_away) / 2
@@ -2275,11 +2625,20 @@ class LiveMatchMatcher:
                             cprint("   ⚠️ HKJC detailed odds failed", Fore.YELLOW)
 
                 disk_stats, disk_status = self.load_titan_stats_from_disk(titan_id)
+                if disk_status != "full":
+                    try:
+                        scraped, status = await self.titan_scraper.scrape_one(titan_id)
+                        disk_stats = scraped if status != "error" else None
+                        disk_status = status
+                        if status == "full":
+                            self.titan_stats_processed.add(titan_id)
+                            save_cache_set(TITAN_STATS_PROCESSED_PATH, self.titan_stats_processed)
+                    except Exception as e:
+                        logger.warning("Titan live scrape failed for %s: %s", titan_id, e)
+
                 if disk_status == "full":
                     detailed_stats = disk_stats
                     detailed_stats["stats_available"] = True
-                    self.titan_stats_processed.add(titan_id)
-                    save_cache_set(TITAN_STATS_PROCESSED_PATH, self.titan_stats_processed)
                     matched_item['detailed_stats'] = detailed_stats
                     matched_item['titan_stats_available'] = True
                 else:
@@ -2299,6 +2658,29 @@ class LiveMatchMatcher:
                     cprint("   ⏭️ Using cached AI recommendation (no API call)", Fore.YELLOW)
                 else:
                     normalized = normalize_parsed_data(detailed_stats)
+
+                    if not has_meaningful_data_for_ai(normalized):
+                        matched_item["ai_status"] = "no_data"
+                        matched_item["ai_reason"] = "no_sections_or_ratings"
+                        matched_item["ai_recommendation"] = {
+                            "best_bet_market": "No Data",
+                            "best_bet_selection": "No Analysis Available",
+                            "confidence_level": 0,
+                            "brief_reasoning": "Insufficient statistical data available for analysis.",
+                            "ai_parsed_json": None,
+                        }
+                        matched.append(matched_item)
+                        self.data_quality_metrics["high_confidence_matches"] += 1
+                        continue
+
+                    odds_bundle = {}
+                    hk_odds = matched_item.get("hkjc_detailed_odds") or self.hkjc_bulk_odds.get(hkjc_event_id)
+                    if hk_odds:
+                        odds_bundle["hkjc"] = hk_odds
+                    if matched_item.get("macau_match"):
+                        odds_bundle["macau"] = matched_item["macau_match"]
+                    normalized["_odds_bundle"] = odds_bundle
+
                     if DEBUG_INSTRUMENTATION_AVAILABLE:
                         try:
                             save_parsed_json("ai_prompt", titan_id, {"prompt_src": "full"})
@@ -2310,6 +2692,7 @@ class LiveMatchMatcher:
                     matched_item['ai_recommendation'] = ai_result
                     matched_item["ai_status"] = "ok" if ai_result.get("ai_parsed_json") else "no_json"
                     matched_item["ai_reason"] = "" if ai_result.get("ai_parsed_json") else ai_result.get("brief_reasoning", "No parsable JSON")
+
                     self.ai_cache[titan_id] = {
                         "processed_at": datetime.now().isoformat(),
                         "hkjc_match_id": hkjc.get("match_id", ""),
@@ -2329,6 +2712,124 @@ class LiveMatchMatcher:
                         reason = f"Similarity {best_score:.2f} below threshold"
                     cprint(f"\n❌ NO MATCH: {hkjc['home_team']} vs {hkjc['away_team']}", Fore.RED)
                     cprint(f"   Reason: {reason}", Fore.RED)
+
+        # --- Relaxed second pass (exact time + looser name) ---
+        unmatched_titan = [t for t in titan_matches if t.get("match_id") not in {m["titan_match"]["match_id"] for m in matched if m.get("titan_match")}]
+        relaxed_matches, still_hkjc, still_titan = self.relaxed_second_pass(
+            hkjc_pool=unmatched_hkjc,
+            titan_pool=unmatched_titan,
+            macau_map=self.macau_mapping,
+            time_grace_minutes=2,
+            name_floor_time_ok=0.40,
+            name_floor_no_time=0.55,
+            margin=0.05,
+        )
+        unmatched_hkjc = still_hkjc
+
+        for hkjc, titan, macau, score in relaxed_matches:
+            titan_id = titan["match_id"]
+            source_type = "hkjc_titan_macau" if macau else "hkjc_titan"
+            matched_item = {
+                "source_coverage": source_type + "_relaxed",
+                "hkjc_match": {
+                    "match_id": hkjc.get('match_id', ''),
+                    "event_id": hkjc.get('event_id', ''),
+                    "home_team": hkjc['home_team'],
+                    "away_team": hkjc['away_team'],
+                    "match_time": hkjc.get('match_time_original', ''),
+                    "tournament": hkjc.get('tournament', '')
+                },
+                "titan_match": {
+                    "match_id": titan_id,
+                    "home_team": titan['home_team'],
+                    "away_team": titan['away_team'],
+                    "scheduled_time": titan.get('scheduled_time_original', ''),
+                    "league": hkjc.get('tournament', ''),
+                    "status": titan.get('match_status', '')
+                },
+                "macau_match": macau,
+                "similarity_score": score,
+                "teams_swapped": False,
+                "matched_at": datetime.now().isoformat()
+            }
+
+            hkjc_event_id = hkjc.get("event_id")
+            if hkjc_event_id:
+                cached_odds = self.hkjc_bulk_odds.get(hkjc_event_id)
+                if cached_odds:
+                    matched_item["hkjc_detailed_odds"] = cached_odds
+
+            disk_stats, disk_status = self.load_titan_stats_from_disk(titan_id)
+            if disk_status != "full":
+                try:
+                    scraped, status = await self.titan_scraper.scrape_one(titan_id)
+                    disk_stats = scraped if status != "error" else None
+                    disk_status = status
+                    if status == "full":
+                        self.titan_stats_processed.add(titan_id)
+                        save_cache_set(TITAN_STATS_PROCESSED_PATH, self.titan_stats_processed)
+                except Exception as e:
+                    logger.warning("Titan live scrape failed for %s: %s", titan_id, e)
+
+            if disk_status == "full":
+                detailed_stats = disk_stats
+                detailed_stats["stats_available"] = True
+                matched_item['detailed_stats'] = detailed_stats
+                matched_item['titan_stats_available'] = True
+            else:
+                matched_item['titan_stats_available'] = False
+                matched_item['ai_status'] = "skipped"
+                matched_item['ai_reason'] = f"titan_stats_{disk_status}_on_disk"
+                matched.append(matched_item)
+                self.data_quality_metrics['high_confidence_matches'] += 1
+                continue
+
+            cached_ai = self.ai_cache.get(titan_id)
+            if cached_ai and cached_ai.get("ai_result"):
+                matched_item["ai_recommendation"] = cached_ai["ai_result"]
+                matched_item["ai_status"] = "cached"
+                matched_item["ai_reason"] = "ai_cached"
+            else:
+                normalized = normalize_parsed_data(detailed_stats)
+                if not has_meaningful_data_for_ai(normalized):
+                    matched_item["ai_status"] = "no_data"
+                    matched_item["ai_reason"] = "no_sections_or_ratings"
+                    matched_item["ai_recommendation"] = {
+                        "best_bet_market": "No Data",
+                        "best_bet_selection": "No Analysis Available",
+                        "confidence_level": 0,
+                        "brief_reasoning": "Insufficient statistical data available for analysis.",
+                        "ai_parsed_json": None,
+                    }
+                    matched.append(matched_item)
+                    self.data_quality_metrics["high_confidence_matches"] += 1
+                    continue
+
+                odds_bundle = {}
+                hk_odds = matched_item.get("hkjc_detailed_odds") or self.hkjc_bulk_odds.get(hkjc_event_id)
+                if hk_odds:
+                    odds_bundle["hkjc"] = hk_odds
+                if macau:
+                    odds_bundle["macau"] = macau
+                normalized["_odds_bundle"] = odds_bundle
+
+                cprint("   🤖 Running AI analysis (relaxed match)...", Fore.CYAN)
+                ai_result = await perform_ai_analysis_for_match_async(normalized, call_deepseek_api_async)
+                matched_item["ai_recommendation"] = ai_result
+                matched_item["ai_status"] = "ok" if ai_result.get("ai_parsed_json") else "no_json"
+                matched_item["ai_reason"] = "" if ai_result.get("ai_parsed_json") else ai_result.get("brief_reasoning", "No parsable JSON")
+
+                self.ai_cache[titan_id] = {
+                    "processed_at": datetime.now().isoformat(),
+                    "hkjc_match_id": hkjc.get("match_id", ""),
+                    "home_team": hkjc.get("home_team"),
+                    "away_team": hkjc.get("away_team"),
+                    "ai_result": ai_result,
+                }
+                save_ai_cache(self.ai_cache)
+
+            matched.append(matched_item)
+            self.data_quality_metrics["high_confidence_matches"] += 1
 
         # Titan + Macau-only AI (no HKJC match)
         cprint("\n🔄 Titan + Macau-only AI (no HKJC match)...", Fore.BLUE)
@@ -2373,23 +2874,43 @@ class LiveMatchMatcher:
                 continue
 
             disk_stats, disk_status = self.load_titan_stats_from_disk(titan_id)
-            if disk_status == "full":
-                detailed_stats = disk_stats
-                detailed_stats["stats_available"] = True
-                self.titan_stats_processed.add(titan_id)
-                save_cache_set(TITAN_STATS_PROCESSED_PATH, self.titan_stats_processed)
-            else:
+            if disk_status != "full":
+                try:
+                    scraped, status = await self.titan_scraper.scrape_one(titan_id)
+                    disk_stats = scraped if status != "error" else None
+                    disk_status = status
+                    if status == "full":
+                        self.titan_stats_processed.add(titan_id)
+                        save_cache_set(TITAN_STATS_PROCESSED_PATH, self.titan_stats_processed)
+                except Exception as e:
+                    logger.warning("Titan live scrape failed for %s: %s", titan_id, e)
+
+            if disk_status != "full" or not disk_stats or not disk_stats.get("has_stats"):
                 matched_item["titan_stats_available"] = False
-                matched_item["skipped_reason"] = f"titan_stats_{disk_status}_on_disk"
                 matched_item["ai_status"] = "skipped"
-                matched_item["ai_reason"] = matched_item["skipped_reason"]
+                matched_item["ai_reason"] = "titan_no_stats"
                 matched.append(matched_item)
                 continue
 
-            matched_item["detailed_stats"] = detailed_stats
+            matched_item["detailed_stats"] = disk_stats
             matched_item["titan_stats_available"] = True
 
-            normalized = normalize_parsed_data(detailed_stats)
+            normalized = normalize_parsed_data(disk_stats)
+            if not has_meaningful_data_for_ai(normalized):
+                matched_item["ai_status"] = "no_data"
+                matched_item["ai_reason"] = "no_sections_or_ratings"
+                matched_item["ai_recommendation"] = {
+                    "best_bet_market": "No Data",
+                    "best_bet_selection": "No Analysis Available",
+                    "confidence_level": 0,
+                    "brief_reasoning": "Insufficient statistical data available for analysis.",
+                    "ai_parsed_json": None,
+                }
+                matched.append(matched_item)
+                continue
+
+            normalized["_odds_bundle"] = {"macau": macau}
+
             cprint("   🤖 Running AI analysis (Titan+Macau-only)...", Fore.CYAN)
             ai_result = await perform_ai_analysis_for_match_async(normalized, call_deepseek_api_async)
             matched_item["ai_recommendation"] = ai_result
@@ -2413,6 +2934,16 @@ class LiveMatchMatcher:
         save_ai_cache(self.ai_cache)
         save_cache_set(HKJC_ODDS_PROCESSED_PATH, self.hkjc_odds_processed)
         save_cache_set(TITAN_STATS_PROCESSED_PATH, self.titan_stats_processed)
+        save_alias_table_if_needed()
+
+        # Log off-grid names to unalias_pending.json
+        # Log only truly unmatched HKJC names (post both passes) to unalias_pending.json
+        for h in unmatched_hkjc:
+            append_unalias_pending("teams", h.get("home_team", ""), source="hkjc", context="unmatched_final_home")
+            append_unalias_pending("teams", h.get("away_team", ""), source="hkjc", context="unmatched_final_away")
+            append_unalias_pending("leagues", h.get("tournament", ""), source="hkjc", context="unmatched_final_league")
+
+        # Could also log titan/macau-only unmatched if desired.
 
         cprint(f"\n📊 FINAL RESULTS:", Fore.CYAN)
         cprint(f"   ✅ Matched games: {len(matched)}", Fore.GREEN)
@@ -2434,14 +2965,7 @@ class LiveMatchMatcher:
                 "total_unmatched": len(self.unmatched_games),
                 "data_quality_metrics": self.data_quality_metrics
             },
-            "top_matches": sorted(self.matched_games, key=lambda x: x.get('similarity_score', 0), reverse=True)[:5],
-            "common_issues": [],
-            "recommendations": []
         }
-        if self.data_quality_metrics['total_hkjc_matches'] == 0:
-            report['common_issues'].append("No matches found on HKJC")
-        if self.data_quality_metrics['total_titan_matches'] == 0:
-            report['common_issues'].append("No matches found on Titan007")
         return report
 
     def save_report(self, report: Dict, filename: Optional[str] = None):
@@ -2512,7 +3036,7 @@ class LiveMatchMatcher:
         for m in matched_games:
             h = m.get("hkjc_match") or {}
             t = m.get("titan_match") or {}
-            mc = m.get("macau_match") or {}  # ←←←← 加上这一行！
+            mc = m.get("macau_match") or {}
             ai = m.get("ai_recommendation", {}) or {}
             rows.append({
                 "hkjc_match_id": h.get("match_id"),
