@@ -106,7 +106,7 @@ class MacauSlotOddsScraper:
         cprint(f"   Saved MacauSlot data to {filename}", Fore.GREEN)
         return filepath
     
-    def save_to_excel(self, matches: List[Dict[str, Any]]) -> Path:
+    def save_to_excel(self, matches: List[Dict[str, Any]]) -> Optional[Path]:
         """
         Save scraped matches to Excel file.
         
@@ -114,7 +114,7 @@ class MacauSlotOddsScraper:
             matches: List of match dictionaries
             
         Returns:
-            Path to saved file
+            Path to saved file, or None if no matches provided
         """
         if not matches:
             logger.warning("No matches to save to Excel")

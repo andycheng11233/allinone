@@ -104,7 +104,7 @@ def load_titan_stats_from_disk(match_id: str) -> Tuple[Optional[Dict[str, Any]],
         ("full", TITAN_STATS_FULL / f"{match_id}.json"),
         ("missing", TITAN_STATS_MISSING / f"{match_id}.json"),
         ("incomplete", TITAN_STATS_INCOMPLETE / f"{match_id}.json"),
-        ("missing", TITAN_STATS_COMPLETELY_MISSING / f"{match_id}.json"),
+        ("completelymissing", TITAN_STATS_COMPLETELY_MISSING / f"{match_id}.json"),
     ]
     
     for status, path in try_paths:

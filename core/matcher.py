@@ -21,9 +21,9 @@ from typing import Dict, List, Optional, Tuple, Any
 
 import pandas as pd
 
-from core.utils import cprint, logger, Fore, AI_CACHE_PATH, HKJC_ODDS_PROCESSED_PATH, TITAN_STATS_PROCESSED_PATH
-from core.alias import normalize_team_name, normalize_league, upsert_alias, save_alias_table_if_needed, append_unalias_pending
-from core.ai import call_deepseek_api, normalize_parsed_data, has_meaningful_data_for_ai, perform_ai_analysis_for_match
+from .utils import cprint, logger, Fore, AI_CACHE_PATH, HKJC_ODDS_PROCESSED_PATH, TITAN_STATS_PROCESSED_PATH
+from .alias import normalize_team_name, normalize_league, upsert_alias, save_alias_table_if_needed, append_unalias_pending
+from .ai import call_deepseek_api, normalize_parsed_data, has_meaningful_data_for_ai, perform_ai_analysis_for_match
 from scrapers.hkjc import HKJCHomeScraper, HKJCDetailedOddsScraper, HKJCBulkOddsCollector, load_hkjc_odds_from_disk
 from scrapers.titan import TitanStatsScraper, load_titan_stats_from_disk
 from scrapers.macauslot import MacauSlotOddsScraper

@@ -6,8 +6,11 @@ Handles loading, saving, and resolving aliases across different sources.
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Dict, Any
+
+from .utils import strip_accents
 
 logger = logging.getLogger("matcher")
 
@@ -102,9 +105,6 @@ def upsert_alias(kind: str, raw_name: str, source: str):
         
     Canonical preference: hkjc > macauslot > titan. If HKJC shows up later, canonical is promoted.
     """
-    from .utils import strip_accents
-    import re
-    
     global alias_modified
 
     if not raw_name:
@@ -112,7 +112,7 @@ def upsert_alias(kind: str, raw_name: str, source: str):
     if kind not in ("teams", "leagues"):
         return
 
-    # Import normalization functions locally to avoid circular imports
+    # Normalize the name based on kind
     if kind == "teams":
         base_norm = normalize_team_name(raw_name, apply_alias=False)
     else:
@@ -175,9 +175,6 @@ def upsert_alias(kind: str, raw_name: str, source: str):
 
 def normalize_team_name(name: str, apply_alias: bool = True) -> str:
     """Normalize a team name for comparison."""
-    from .utils import strip_accents
-    import re
-    
     if not name:
         return ""
     name = strip_accents(name)
@@ -195,9 +192,6 @@ def normalize_team_name(name: str, apply_alias: bool = True) -> str:
 
 def normalize_league(text: str, apply_alias: bool = True) -> str:
     """Normalize a league name for comparison."""
-    from .utils import strip_accents
-    import re
-    
     if not text:
         return ""
     t = strip_accents(text).lower()
