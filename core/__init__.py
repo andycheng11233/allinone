@@ -41,6 +41,13 @@ from .utils import (
     MIN_SECTIONS_FOR_FULL,
 )
 
+from .matcher import (
+    LiveMatchMatcher,
+    name_similarity,
+    league_bonus,
+    token_overlap_score,
+)
+
 __all__ = [
     # Alias management
     'load_alias_table_from_json',
@@ -62,6 +69,11 @@ __all__ = [
     'build_ai_prompt_with_availability',
     'parse_ai_json_response',
     'perform_ai_analysis_for_match',
+    # Matcher
+    'LiveMatchMatcher',
+    'name_similarity',
+    'league_bonus',
+    'token_overlap_score',
     # Utilities
     'cprint',
     'strip_accents',
